@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# oscore_cloud: reusable OSCORE cloud client library.
+
+menuconfig OSCORE_CLOUD
+	bool "OSCORE cloud client library"
+	depends on UOSCORE
+	help
+	  A framework-agnostic OSCORE cloud client: CoAP/OSCORE transport, a
+	  minimal CBOR codec, and structured telemetry / device-shadow / downlink
+	  operations. It has no dependency on zbus or the Zephyr State Machine
+	  Framework and can be driven from a plain main()-loop application.
+
+	  Enabling this requires a CoAP + UDP socket transport (CONFIG_COAP,
+	  CONFIG_NET_SOCKETS) and, for replay-counter persistence, the settings
+	  subsystem (CONFIG_SETTINGS).
+
+if OSCORE_CLOUD
+
+config OSCORE_CLOUD_SESSION
+	bool "Connection / session helper"
+	default y
+	help
+	  Build the framework-free connection helper (oscore_cloud_connect,
+	  reconnection backoff, and oscore_cloud_send_telemetry which posts a
+	  telemetry record and drives the resulting downlink / FOTA work). A
+	  simple application uses this instead of writing its own state machine.
+
+config OSCORE_CLOUD_FOTA
+	bool "OSCORE FOTA client"
+	depends on DFU_TARGET
+	help
+	  Build the OSCORE FOTA client (GET/POST /f, Block2 image download,
+	  MCUboot / modem-delta apply and boot-time reconciliation).
+
+config OSCORE_CLOUD_AGNSS
+	bool "OSCORE A-GNSS client"
+	help
+	  Build the OSCORE A-GNSS client that fetches GPS assistance (POST /a,
+	  CBOR over Block2) and writes it to the nRF modem GNSS core.
+
+config OSCORE_CLOUD_BACKOFF_INITIAL_SECONDS
+	int "Default initial reconnection backoff (seconds)"
+	default 60
+	help
+	  Default initial backoff used by oscore_cloud_backoff_seconds() when the
+	  application does not override it through struct oscore_cloud_config.
+
+config OSCORE_CLOUD_BACKOFF_MAX_SECONDS
+	int "Default maximum reconnection backoff (seconds)"
+	default 3600
+	help
+	  Upper bound for the reconnection backoff computed by
+	  oscore_cloud_backoff_seconds().
+
+choice OSCORE_CLOUD_BACKOFF_TYPE
+	prompt "Reconnection backoff type"
+	default OSCORE_CLOUD_BACKOFF_TYPE_EXPONENTIAL
+
+config OSCORE_CLOUD_BACKOFF_TYPE_EXPONENTIAL
+	bool "Exponential backoff"
+
+config OSCORE_CLOUD_BACKOFF_TYPE_LINEAR
+	bool "Linear backoff"
+
+config OSCORE_CLOUD_BACKOFF_TYPE_NONE
+	bool "Constant (no backoff growth)"
+
+endchoice
+
+config OSCORE_CLOUD_BACKOFF_LINEAR_INCREMENT_SECONDS
+	int "Linear backoff increment (seconds)"
+	default 60
+	depends on OSCORE_CLOUD_BACKOFF_TYPE_LINEAR
+
+module = OSCORE_CLOUD
+module-str = OSCORE cloud
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # OSCORE_CLOUD

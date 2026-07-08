@@ -1,0 +1,14 @@
+# Build artifacts
+build/
+build*/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+
+# Zephyr / west (in case this module is checked out inside a workspace root)
+.west/
+twister-out*/

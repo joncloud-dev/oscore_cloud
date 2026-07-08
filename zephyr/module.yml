@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Makes oscore_cloud a self-contained Zephyr module so a separate application /
+# west workspace can consume it directly (via manifest.projects or
+# ZEPHYR_EXTRA_MODULES). Inside the Asset-Tracker-Template the library is instead
+# pulled in as a subdirectory from the repo-root CMakeLists.txt / Kconfig, which
+# is why the paths below point at this module's own root.
+name: oscore_cloud
+build:
+  cmake: .
+  kconfig: Kconfig
+  settings:
+    # Public headers live under include/, included as <oscore_cloud/...>.
+    ext_root: .
