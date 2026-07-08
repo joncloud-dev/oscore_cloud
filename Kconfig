@@ -17,6 +17,23 @@ menuconfig OSCORE_CLOUD
 
 if OSCORE_CLOUD
 
+config OSCORE_SERVER_IP
+	string "OSCORE server IPv4 address"
+	default "192.168.1.100"
+	help
+	  Default CoAP/OSCORE server address (IPv4, as a string). Used as the
+	  compile-time default by the client when the application does not set
+	  struct oscore_cloud_config.server_ip at runtime.
+
+config OSCORE_USE_EDHOC
+	bool "Use EDHOC for OSCORE key establishment"
+	default n
+	help
+	  Run EDHOC (POST /.well-known/edhoc) with the server to derive the OSCORE
+	  context at runtime instead of using a provisioned / hardcoded context.
+	  When enabled, the application must provide edhoc_credentials.h. Leave
+	  disabled to use the bench-provisioned opaque-key context (the default).
+
 config OSCORE_CLOUD_SESSION
 	bool "Connection / session helper"
 	default y
@@ -71,7 +88,11 @@ endchoice
 config OSCORE_CLOUD_BACKOFF_LINEAR_INCREMENT_SECONDS
 	int "Linear backoff increment (seconds)"
 	default 60
-	depends on OSCORE_CLOUD_BACKOFF_TYPE_LINEAR
+	help
+	  Per-attempt increment for the linear reconnection backoff. Only used
+	  when OSCORE_CLOUD_BACKOFF_TYPE_LINEAR is selected, but always defined so
+	  the (dead) linear branch in cloud_session.c compiles under the other
+	  backoff types too.
 
 module = OSCORE_CLOUD
 module-str = OSCORE cloud
