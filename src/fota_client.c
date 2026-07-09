@@ -80,8 +80,9 @@ LOG_MODULE_REGISTER(fota_client, LOG_LEVEL_INF);
  * (APP_STORAGE_SESSION_TIMEOUT_SECONDS, 30 s) if that pickup never happens —
  * dropping the telemetry sample.
  *
- * Blocks are 1024 B (see g_block_szx; enabled by raising OSCORE_MAX_PLAINTEXT_LEN,
- * which previously overran uoscore's decrypt buffer at 1024 B). On a degraded
+ * Blocks are 512 B (see g_block_szx; 1024 B requires OSCORE_MAX_PLAINTEXT_LEN
+ * to be raised to 1536 in the uoscore build, else decrypt overruns the buffer).
+ * On a degraded
  * LTE-M link a block runs ~1.5 s and up to ~10 s on a single lost datagram
  * (BLOCK2_RECV_TIMEOUT_MS before retransmit). At 8 blocks/step that put a step
  * at 12-30+ s and routinely tripped the 30 s session timeout. Keeping it small
@@ -916,15 +917,17 @@ static int fota_dl_begin(const struct cloud_fota_notice *notice)
 		}
 	}
 
-	/* SZX 6 = 1024 B blocks, halving the round-trips vs 512 B. This earlier
-	 * failed with psa_aead_decrypt -> unexpected_result_from_ext_lib: that was
-	 * PSA returning BUFFER_TOO_SMALL because uoscore's plaintext output buffer
-	 * (OSCORE_MAX_PLAINTEXT_LEN, default 1064) couldn't hold a 1024 B body plus
-	 * the inner CoAP frame. Raised to 1536 in CMakeLists, so 1024 B now fits.
-	 * (Independently, the server no longer re-reads the image from byte 0 per
-	 * block, O(N^2) -> O(1), removing the progressive per-block slowdown.)
+	/* SZX 5 = 512 B blocks. SZX 6 (1024 B) halves the round-trips but requires
+	 * uoscore's plaintext output buffer (OSCORE_MAX_PLAINTEXT_LEN) to be raised
+	 * from its 1064 default to 1536; when that build override is not applied to
+	 * the uoscore-uedhoc library, decrypting a 1024 B Block2 body overruns the
+	 * buffer and PSA psa_aead_decrypt returns BUFFER_TOO_SMALL, surfaced as
+	 * oscore2coap -> unexpected_result_from_ext_lib (err 3) on every block. A
+	 * 512 B body fits the default buffer, so this is the safe, always-working
+	 * choice. Bump back to 6 only once OSCORE_MAX_PLAINTEXT_LEN=1536 is verified
+	 * to reach the uoscore library in the build.
 	 */
-	g_block_szx = 6;
+	g_block_szx = 5;
 	g_block_size = 1U << (g_block_szx + 4);
 	g_next_block = (uint32_t)(offset / g_block_size);
 
