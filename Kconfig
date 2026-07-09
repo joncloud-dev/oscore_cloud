@@ -94,6 +94,131 @@ config OSCORE_CLOUD_BACKOFF_LINEAR_INCREMENT_SECONDS
 	  the (dead) linear branch in cloud_session.c compiles under the other
 	  backoff types too.
 
+# ---------------------------------------------------------------------------
+# Device observability (Memfault-style), reported natively over the existing
+# OSCORE telemetry uplink. See OBSERVABILITY.md for the wire protocol and the
+# backend side.
+# ---------------------------------------------------------------------------
+menuconfig OSCORE_CLOUD_DIAG
+	bool "Device observability (diagnostics)"
+	select HWINFO
+	select REBOOT
+	help
+	  Native device observability: reboot-reason tracking, a health-vitals
+	  heartbeat, and minimal crash reports. Signals are folded into the
+	  ordinary OSCORE telemetry uplink as nested CBOR maps (keys 20/21/22/23)
+	  and ingested by the PocketBase server. State persists across a warm reset
+	  in a __noinit "retained" RAM region guarded by a magic word and CRC32.
+
+	  With OSCORE_CLOUD_DIAG_AUTO_ATTACH (default y) the session helper folds
+	  the signals into every telemetry post automatically; the application only
+	  calls oscore_cloud_diag_init() once at boot.
+
+if OSCORE_CLOUD_DIAG
+
+config OSCORE_CLOUD_DIAG_VITALS
+	bool "Collect health vitals heartbeat (key 21)"
+	default y
+	help
+	  Sample heap/stack headroom, modem signal quality and battery into a
+	  periodic vitals heartbeat folded into telemetry.
+
+config OSCORE_CLOUD_DIAG_CRASH
+	bool "Capture minimal crash reports (key 22)"
+	default y
+	help
+	  Install a k_sys_fatal_error_handler that snapshots the fault registers and
+	  a slice of the crashing stack into retained RAM, uploaded on the next boot
+	  for server-side symbolication.
+
+	  This provides the single definition of k_sys_fatal_error_handler, so the
+	  consuming application MUST disable Zephyr's default handler with
+	  CONFIG_RESET_ON_FATAL_ERROR=n to avoid a duplicate-symbol link error.
+
+config OSCORE_CLOUD_DIAG_BREADCRUMBS
+	bool "Capture log breadcrumbs at crash time"
+	default y
+	depends on OSCORE_CLOUD_DIAG_CRASH
+	depends on LOG
+	help
+	  Register a lightweight log backend that keeps the most recent log output in
+	  a RAM ring. The fatal handler snapshots the ring into retained RAM so the
+	  last lines before a crash travel with the crash report (CBOR key 22 "bc")
+	  for display next to the symbolicated backtrace.
+
+config OSCORE_CLOUD_DIAG_BREADCRUMB_SIZE
+	int "Breadcrumb ring size (bytes)"
+	default 1024
+	depends on OSCORE_CLOUD_DIAG_BREADCRUMBS
+	help
+	  Size of both the live log ring and the retained crash snapshot. Two buffers
+	  of this size are reserved; keep it modest to respect the small retained RAM
+	  budget and the NTN uplink (only the first 256 bytes ride the minimal report;
+	  the remainder is recoverable from the coredump).
+
+config OSCORE_CLOUD_DIAG_BUILD_ID
+	bool "Embed a GNU build-id and report it as the firmware version"
+	default y
+	help
+	  Reserve a ROM slot for the linker's GNU build-id note (a hash of the
+	  binary) via a linker fragment, and expose app_fw_version() /
+	  app_build_id_hex(). The auto-generated firmware version is
+	  APP_VERSION_STRING + "+" + the first hex digits of the build-id, so every
+	  build is distinguishable in the fleet and crash reports carry an exact
+	  symbol-ELF selector. Requires an app_version.h (a Zephyr VERSION file in
+	  the application).
+
+config OSCORE_CLOUD_DIAG_DEVICE_INFO
+	bool "Report static device info once on connect (key 23)"
+	default y
+	depends on MODEM_INFO
+	help
+	  Report board name, modem firmware version, IMEI and SIM ICCID one-shot
+	  after boot. The server folds these onto the device record.
+
+config OSCORE_CLOUD_DIAG_COREDUMP_BACKEND_NVMC
+	bool "Fault-safe nrfx_nvmc flash coredump backend"
+	depends on OSCORE_CLOUD_DIAG_CRASH
+	depends on DEBUG_COREDUMP_BACKEND_OTHER
+	help
+	  Store full coredumps in an internal-flash partition via nrfx_nvmc (safe
+	  from the fatal handler on nRF91 non-secure, where the stock flash backend
+	  deadlocks). Provides the out-of-tree coredump_backend_other, so the
+	  application must select the "other" backend
+	  (CONFIG_DEBUG_COREDUMP_BACKEND_OTHER=y). Requires a `coredump_partition`
+	  DT nodelabel attributed non-secure. Leave disabled to use Zephyr's
+	  in-memory coredump backend (survives a warm reset only), which needs no
+	  devicetree overlay.
+
+config OSCORE_CLOUD_DIAG_AUTO_ATTACH
+	bool "Fold diagnostics into telemetry automatically"
+	default y
+	depends on OSCORE_CLOUD_SESSION
+	help
+	  When set, oscore_cloud_send_telemetry() automatically attaches any pending
+	  diagnostics to each telemetry post, clears the one-shots on success, and
+	  uploads a stored coredump on a terrestrial bearer. Disable to take manual
+	  control (e.g. to report observability on a slower cadence): call
+	  oscore_cloud_diag_attach()/_attach_clear()/_after_send() yourself.
+
+config OSCORE_CLOUD_DIAG_VITALS_INTERVAL
+	int "Telemetry sends between vitals heartbeats"
+	default 1
+	depends on OSCORE_CLOUD_DIAG_VITALS
+	help
+	  Attach the vitals heartbeat (key 21) only every Nth call to
+	  oscore_cloud_diag_attach(), so fleet-health vitals can ride the telemetry
+	  uplink at a lower cadence than the telemetry itself (saving bandwidth on
+	  sleepy NTN/NB-IoT links) while still sharing the same packet. 1 = every
+	  send. Urgent one-shots (boot report, crash) ignore this and are always
+	  attached on the next post.
+
+module = OSCORE_CLOUD_DIAG
+module-str = OSCORE cloud diagnostics
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # OSCORE_CLOUD_DIAG
+
 module = OSCORE_CLOUD
 module-str = OSCORE cloud
 source "subsys/logging/Kconfig.template.log_config"

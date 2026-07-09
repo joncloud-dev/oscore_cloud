@@ -16,6 +16,8 @@ from the Asset-Tracker-Template cloud module.
 | `oscore_cloud/cloud_session.h` | Optional connect / reconnect-backoff / send helper for simple apps |
 | `oscore_cloud/fota_client.h` | OSCORE FOTA (opt-in, `CONFIG_OSCORE_CLOUD_FOTA`) |
 | `oscore_cloud/agnss_client.h` | OSCORE A-GNSS assistance (opt-in, `CONFIG_OSCORE_CLOUD_AGNSS`) |
+| `oscore_cloud/diag.h`, `oscore_cloud/diag_bridge.h` | Device observability collector + telemetry bridge (opt-in, `CONFIG_OSCORE_CLOUD_DIAG`) |
+| `oscore_cloud/build_id.h` | GNU build-id / auto-generated firmware version (`CONFIG_OSCORE_CLOUD_DIAG_BUILD_ID`) |
 | `oscore_cloud/cbor.h` | CBOR codec used by the client |
 | `oscore_cloud/oscore_wrapper.h`, `oscore_cloud/oscore_provision.h` | OSCORE context + bench provisioning |
 
@@ -69,6 +71,89 @@ PSA-provisioned material written once with the `oscore provision ...` shell
 command. A self-contained app may instead hardcode raw keys via the
 `master_secret` / `master_salt` / `sender_id` / `recipient_id` fields of
 `struct oscore_cloud_config`.
+
+## Device observability (`CONFIG_OSCORE_CLOUD_DIAG`)
+
+An optional, Memfault-style fleet-observability layer that reports device-health
+signals natively over the existing telemetry uplink — no extra agent, no extra
+CoAP route. Four signals are folded into an ordinary `POST /t` as nested CBOR
+maps, so an NTN device spends a single round-trip:
+
+| Key | Signal | Kconfig |
+| --- | --- | --- |
+| 20 | Reboot report (hwinfo cause + app intent, boot counter) | `OSCORE_CLOUD_DIAG` |
+| 21 | Health-vitals heartbeat (heap/stack/CPU, modem RSRP/SNR/temp/band, airtime, PSM) | `OSCORE_CLOUD_DIAG_VITALS` |
+| 22 | Minimal crash report (fault regs + stack slice + build-id + breadcrumbs) | `OSCORE_CLOUD_DIAG_CRASH` |
+| 23 | Static device info (board, modem fw, IMEI, ICCID), one-shot on connect | `OSCORE_CLOUD_DIAG_DEVICE_INFO` |
+
+The full Zephyr coredump is pulled on demand over CoAP Block1 (`POST /c`), only
+on a terrestrial bearer. See the top-level `OBSERVABILITY.md` for the wire
+protocol and the backend side.
+
+### Usage — automatic (default)
+
+Enable the option and call `oscore_cloud_diag_init()` once at boot; the session
+helper (`oscore_cloud_send_telemetry`) folds the pending diagnostics into every
+post, clears the one-shots on success, and uploads a stored coredump on
+terrestrial LTE:
+
+```c
+#include <oscore_cloud/cloud_session.h>
+#include <oscore_cloud/diag_bridge.h>
+
+void main(void) {
+    oscore_cloud_diag_init();   /* boot report + crash recovery, once, early */
+    settings_subsys_init();
+    /* ... bring up network, oscore_cloud_init() ... */
+    while (1) {
+        struct cloud_telemetry t;
+        cloud_telemetry_init(&t);
+        cloud_telemetry_set_transport(&t, CLOUD_TRANSPORT_TN);
+        oscore_cloud_send_telemetry(&t, NULL, NULL);  /* diagnostics ride along */
+        k_sleep(K_SECONDS(600));
+    }
+}
+```
+
+### Usage — manual control / slower cadence
+
+Urgent one-shots (boot report, crash) always ride the next post, while the
+vitals heartbeat rides only every `CONFIG_OSCORE_CLOUD_DIAG_VITALS_INTERVAL`
+sends — so fleet vitals can be reported at a lower cadence than telemetry while
+still sharing the same packet (saving uplink bytes). For full control, set
+`CONFIG_OSCORE_CLOUD_DIAG_AUTO_ATTACH=n` and drive the bridge yourself around
+your own `cloud_client_post_telemetry()`:
+
+```c
+struct cloud_telemetry t; cloud_telemetry_init(&t); /* ... */
+bool oneshot = oscore_cloud_diag_attach(&t);
+if (cloud_client_post_telemetry(&t, &dl) == 0 && oneshot) {
+    oscore_cloud_diag_attach_clear();
+    oscore_cloud_diag_after_send(t.transport);
+}
+```
+
+### Requirements / coupling
+
+- **Single fatal handler**: `OSCORE_CLOUD_DIAG_CRASH` defines
+  `k_sys_fatal_error_handler`, so the application must set
+  `CONFIG_RESET_ON_FATAL_ERROR=n` (otherwise the link fails with a duplicate
+  symbol).
+- **Firmware version**: `OSCORE_CLOUD_DIAG_BUILD_ID` reports
+  `<APP_VERSION_STRING>+<build-id>` as the firmware version, which needs an
+  `app_version.h` — add a Zephyr `VERSION` file to the application (a build with
+  no `VERSION` file reports `0.0.0`).
+- **Coredump backend**: enable one — Zephyr's in-memory backend
+  (`CONFIG_DEBUG_COREDUMP_BACKEND_IN_MEMORY`, no devicetree overlay, survives a
+  warm reset only) or the bundled fault-safe flash backend
+  (`CONFIG_DEBUG_COREDUMP_BACKEND_OTHER=y` +
+  `CONFIG_OSCORE_CLOUD_DIAG_COREDUMP_BACKEND_NVMC=y`, which needs a
+  `coredump_partition` DT nodelabel attributed non-secure on nRF91).
+- **Vitals / device-info sources**: enable the sources you want reported —
+  `CONFIG_SYS_HEAP_RUNTIME_STATS`, `CONFIG_THREAD_MONITOR` +
+  `CONFIG_THREAD_STACK_INFO`, `CONFIG_THREAD_RUNTIME_STATS`, `CONFIG_MODEM_INFO`,
+  `CONFIG_LTE_LINK_CONTROL`. Each source is best-effort; an unavailable one is
+  simply omitted from the wire map.
 
 ## Consuming from another workspace
 

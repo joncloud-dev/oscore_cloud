@@ -40,4 +40,24 @@ zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_FOTA    src/fota_client.c)
 zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_AGNSS   src/agnss_client.c)
 zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_SESSION src/cloud_session.c)
 
+# Device observability collector + bridge (reboot reasons, vitals, crash
+# reports). The bridge folds the collected signals into cloud_telemetry, so it
+# depends on the wire layer above; enabling OSCORE_CLOUD_DIAG is enough.
+zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_DIAG src/diag.c src/diag_bridge.c)
+zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_DIAG_BUILD_ID src/build_id.c)
+zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_DIAG_COREDUMP_BACKEND_NVMC
+  src/coredump_backend_nvmc.c)
+
+# GNU build-id: a hash of the binary embedded by the linker, giving every build
+# an automatically distinct identity. Plain -Wl,--build-id conflicts with
+# Zephyr's linker scripts (orphan .note.gnu.build-id, "cannot move location
+# counter backwards"), so the fragment below reserves an explicit ROM slot for
+# the note. The device reads it at runtime (src/build_id.c) to suffix the
+# reported firmware version and to tag crash reports for exact symbol-ELF
+# matching.
+if(CONFIG_OSCORE_CLOUD_DIAG_BUILD_ID AND NOT CONFIG_ARCH_POSIX)
+  zephyr_ld_options("-Wl,--build-id")
+  zephyr_linker_sources(SECTIONS gnu-build-id.ld)
+endif()
+
 endif() # CONFIG_OSCORE_CLOUD
