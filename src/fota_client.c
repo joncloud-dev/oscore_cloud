@@ -40,9 +40,12 @@
 #include <zephyr/dfu/mcuboot.h>
 #include <dfu/dfu_target.h>
 #include <zephyr/storage/flash_map.h>
+#include <zephyr/drivers/flash.h>
 #include <zephyr/settings/settings.h>
+#if defined(CONFIG_NRF_MODEM_LIB)
 #include <nrf_modem.h>
 #include <modem/nrf_modem_lib.h>
+#endif
 #include <psa/crypto.h>
 #include <string.h>
 #include <stdio.h>
@@ -368,6 +371,7 @@ void fota_client_boot_check(void)
 	}
 }
 
+#if defined(CONFIG_NRF_MODEM_LIB)
 /*
  * Modem DFU result hook. nrf_modem_lib_init() (called by the network module on
  * boot) applies any scheduled modem firmware update and reports the outcome
@@ -420,6 +424,7 @@ static void fota_modem_dfu_res(int dfu_res, void *ctx)
 }
 
 NRF_MODEM_LIB_ON_DFU_RES(fota_modem_dfu_hook, fota_modem_dfu_res, NULL);
+#endif /* CONFIG_NRF_MODEM_LIB */
 
 /* ---- Notice decode / status report ------------------------------------- */
 
@@ -724,8 +729,25 @@ static void erase_secondary_trailer(void)
 		return;
 	}
 
-	const size_t page_size = CONFIG_SPI_NOR_FLASH_LAYOUT_PAGE_SIZE;
-	const off_t trailer_off = fa->fa_size - page_size;
+	/* Query the erase-block size of the flash holding slot1 at runtime rather
+	 * than assuming a specific driver, so this works on both external SPI-NOR
+	 * (att) and internal RRAM (nRF54L host). Falls back to erasing from the
+	 * page containing the slot's last byte. */
+	const struct device *fdev = flash_area_get_device(fa);
+	struct flash_pages_info info;
+	off_t trailer_off;
+	size_t page_size;
+
+	err = flash_get_page_info_by_offs(fdev, fa->fa_off + fa->fa_size - 1, &info);
+	if (err) {
+		LOG_WRN("flash_get_page_info_by_offs(slot1) failed: %d, skipping trailer erase",
+			err);
+		flash_area_close(fa);
+		return;
+	}
+
+	page_size = info.size;
+	trailer_off = info.start_offset - fa->fa_off;
 
 	err = flash_area_erase(fa, trailer_off, page_size);
 	if (err) {
