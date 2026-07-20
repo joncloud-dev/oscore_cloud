@@ -19,6 +19,8 @@
 #endif
 #if defined(CONFIG_OSCORE_CLOUD_DIAG_CRASH)
 #include <zephyr/fatal.h>
+#endif
+#if defined(CONFIG_OSCORE_CLOUD_DIAG_CRASH) || defined(CONFIG_OSCORE_CLOUD_DIAG_LIVENESS)
 #include <zephyr/sys/reboot.h>
 #include <zephyr/logging/log_ctrl.h>
 #endif
@@ -140,6 +142,41 @@ static uint8_t reason_from_hwinfo(uint32_t cause)
 static void bc_boot_recover(bool crash_pending);
 #endif
 
+#if defined(CONFIG_OSCORE_CLOUD_DIAG_LIVENESS)
+/* ---- Cloud-contact liveness watchdog ------------------------------------- */
+/* A software watchdog that reboots the device if it goes too long without a
+ * successful cloud contact (a diag_heartbeat(), posted by the telemetry path
+ * after every accepted uplink). It is armed from boot and rescheduled on every
+ * contact, so it catches the "alive but not progressing with the cloud" failure
+ * mode that the per-thread task watchdog cannot see (threads keep running and
+ * feeding their task watchdogs while the device makes no cloud progress). */
+static void liveness_timeout_work_fn(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(liveness_work, liveness_timeout_work_fn);
+
+static void liveness_timeout_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	LOG_ERR("No successful cloud contact in %d s; rebooting to recover",
+		CONFIG_OSCORE_CLOUD_DIAG_LIVENESS_TIMEOUT_SECONDS);
+
+	/* Attribute the imminent reboot so the next boot report explains it. */
+	diag_set_reboot_reason(DIAG_RESET_WATCHDOG);
+
+	LOG_PANIC();
+	sys_reboot(SYS_REBOOT_COLD);
+}
+
+/* (Re)start the liveness countdown. Called from boot and on every cloud
+ * contact. k_work_reschedule replaces any pending timeout, so a steadily
+ * reporting device never fires. */
+static void liveness_kick(void)
+{
+	(void)k_work_reschedule(&liveness_work,
+		K_SECONDS(CONFIG_OSCORE_CLOUD_DIAG_LIVENESS_TIMEOUT_SECONDS));
+}
+#endif /* CONFIG_OSCORE_CLOUD_DIAG_LIVENESS */
+
 void diag_boot_process(void)
 {
 	uint32_t cause = 0;
@@ -193,6 +230,13 @@ void diag_boot_process(void)
 		memset(&retained.crash, 0, sizeof(retained.crash));
 	}
 	retained_commit();
+
+#if defined(CONFIG_OSCORE_CLOUD_DIAG_LIVENESS)
+	/* Arm the cloud-contact liveness watchdog from boot so a device that never
+	 * establishes cloud contact after a reset is still recovered. Every
+	 * successful contact (diag_heartbeat) reschedules it. */
+	liveness_kick();
+#endif
 }
 
 const struct diag_boot_report *diag_boot_report_get(void)
@@ -225,6 +269,11 @@ void diag_set_reboot_reason(enum diag_reset_reason reason)
 
 void diag_heartbeat(void)
 {
+#if defined(CONFIG_OSCORE_CLOUD_DIAG_LIVENESS)
+	/* A successful cloud contact just happened: defer the liveness reboot.
+	 * Done unconditionally (independent of the retained region's validity). */
+	liveness_kick();
+#endif
 	if (!retained_valid()) {
 		return;
 	}

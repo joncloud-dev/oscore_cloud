@@ -61,7 +61,7 @@ static int g_sock = -1;
  * lost in marginal coverage blocks the cloud thread in recvfrom() indefinitely,
  * starving the task-watchdog feed and forcing a reboot loop. The timeout
  * comfortably exceeds the eDRX cycle (5.12 s). */
-#define REQUEST_RECV_TIMEOUT_MS 10000
+#define REQUEST_RECV_TIMEOUT_MS 30000
 
 static struct cloud_shadow_delta g_inline_delta;
 

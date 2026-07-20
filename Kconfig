@@ -213,6 +213,35 @@ config OSCORE_CLOUD_DIAG_VITALS_INTERVAL
 	  send. Urgent one-shots (boot report, crash) ignore this and are always
 	  attached on the next post.
 
+config OSCORE_CLOUD_DIAG_LIVENESS
+	bool "Cloud-contact liveness watchdog (reboot on cloud stall)"
+	help
+	  Arm a software watchdog that reboots the device if it goes too long
+	  without a successful cloud contact. "Contact" is a diag_heartbeat(),
+	  which the telemetry path calls after every accepted uplink; each contact
+	  reschedules the watchdog, and the timer is armed from boot so a device
+	  that never reaches the cloud is recovered too.
+
+	  This catches the "alive but not progressing" failure mode that the
+	  per-thread task watchdog cannot see: the threads keep running and feeding
+	  their task watchdogs, but the device stops making progress with the cloud
+	  (wedged modem link, stuck retry loop, half-open socket, a peripheral that
+	  no longer comes up). The reboot is attributed as DIAG_RESET_WATCHDOG.
+
+	  Leave disabled on devices that legitimately report less often than the
+	  timeout (deep-sleep / NTN duty cycles), or the device will reboot-loop.
+	  The timeout MUST be comfortably longer than the worst-case telemetry
+	  reporting interval (including retry/backoff).
+
+config OSCORE_CLOUD_DIAG_LIVENESS_TIMEOUT_SECONDS
+	int "Cloud-contact liveness timeout (seconds)"
+	default 7200
+	depends on OSCORE_CLOUD_DIAG_LIVENESS
+	help
+	  Reboot if no successful cloud contact occurs within this many seconds.
+	  Must be well above the telemetry reporting interval so a normally
+	  reporting device never trips it. Default is 2 hours.
+
 module = OSCORE_CLOUD_DIAG
 module-str = OSCORE cloud diagnostics
 source "subsys/logging/Kconfig.template.log_config"
