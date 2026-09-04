@@ -56,6 +56,35 @@ config OSCORE_CLOUD_AGNSS
 	  Build the OSCORE A-GNSS client that fetches GPS assistance (POST /a,
 	  CBOR over Block2) and writes it to the nRF modem GNSS core.
 
+if OSCORE_CLOUD_AGNSS
+
+config OSCORE_CLOUD_AGNSS_WINDOW_S_DEFAULT
+	int "Default A-GNSS pruning look-ahead window (seconds)"
+	default 7200
+	help
+	  Look-ahead window (request field "w") sent by agnss_client_fetch() when
+	  the caller does not override it via agnss_client_fetch_ex(). The server
+	  keeps only satellites visible within this window. 7200 = 2 hours; use 0
+	  for a single-shot / instant fetch (only satellites visible now).
+
+config OSCORE_CLOUD_AGNSS_MAX_SV_DEFAULT
+	int "Default A-GNSS satellite cap (0 = uncapped)"
+	default 0
+	help
+	  Cap on the number of satellites the server returns (request field "n"),
+	  azimuth-spread selected. 0 leaves the visible set uncapped. Used by
+	  agnss_client_fetch() when the caller does not override it.
+
+config OSCORE_CLOUD_AGNSS_COMPACT
+	bool "Request compact positional-array A-GNSS encoding"
+	default y
+	help
+	  Request the compact response encoding (request field "e":1, agnss-schema.md
+	  1.4), which drops per-field CBOR keys (~178 B/SV -> ~78 B/SV). Disable to
+	  request the legacy text-key maps.
+
+endif # OSCORE_CLOUD_AGNSS
+
 config OSCORE_CLOUD_BACKOFF_INITIAL_SECONDS
 	int "Default initial reconnection backoff (seconds)"
 	default 60
