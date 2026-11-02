@@ -611,6 +611,49 @@ const char *diag_breadcrumbs_get(uint16_t *len)
 
 #if defined(CONFIG_OSCORE_CLOUD_DIAG_CRASH)
 
+#if defined(CONFIG_AT_MONITOR) && defined(CONFIG_CPU_CORTEX_M)
+extern void at_monitor_dispatch(const char *notif);
+
+/* at_monitor_dispatch runs in the modem IPC ISR; heap exhaustion trips
+ * __ASSERT(at_notif, ...) (at_monitor.c:79) with lr pointing back into the
+ * dispatch path. esf is often NULL for that panic, so fall back to the fault
+ * stack's saved lr (see Zephyr arch_coredump z_arm_coredump_fault_sp). */
+static bool fatal_is_at_monitor_heap(unsigned int reason, const struct arch_esf *esf)
+{
+	uint32_t lr = 0U;
+
+	if (reason != K_ERR_KERNEL_PANIC) {
+		return false;
+	}
+
+	if (esf != NULL) {
+		lr = esf->basic.lr;
+	} else {
+		extern uint32_t z_arm_coredump_fault_sp;
+		const uint32_t *sp = (const uint32_t *)(uintptr_t)z_arm_coredump_fault_sp;
+
+		if (sp != NULL) {
+			lr = sp[0];
+		}
+	}
+
+	{
+		uintptr_t base = (uintptr_t)(void *)&at_monitor_dispatch;
+		/* Wrapper + .part.0; generous for thumb/LTO layout drift. */
+		const uintptr_t bound = base + 0x300U;
+
+		return lr >= base && lr < bound;
+	}
+}
+#else
+static bool fatal_is_at_monitor_heap(unsigned int reason, const struct arch_esf *esf)
+{
+	ARG_UNUSED(reason);
+	ARG_UNUSED(esf);
+	return false;
+}
+#endif /* CONFIG_AT_MONITOR && CONFIG_CPU_CORTEX_M */
+
 /* Snapshot the fault into the retained region: fault type, core registers from
  * the exception stack frame, and a slice of stack words (the server filters
  * these to code addresses and symbolicates them). Runs in fault context, so it
@@ -659,7 +702,11 @@ static void diag_crash_capture(unsigned int reason, const struct arch_esf *esf)
 	/* Keep a more specific reason if one was set just before the fault (e.g. a
 	 * watchdog timeout), else attribute the reset to the fault itself. */
 	if (retained.pending_reason == DIAG_REASON_NONE) {
-		retained.pending_reason = DIAG_RESET_FATAL;
+		if (fatal_is_at_monitor_heap(reason, esf)) {
+			retained.pending_reason = DIAG_RESET_AT_MONITOR_HEAP;
+		} else {
+			retained.pending_reason = DIAG_RESET_FATAL;
+		}
 	}
 	retained_commit();
 

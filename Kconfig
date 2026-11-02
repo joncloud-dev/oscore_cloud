@@ -85,6 +85,84 @@ config OSCORE_CLOUD_AGNSS_COMPACT
 
 endif # OSCORE_CLOUD_AGNSS
 
+config OSCORE_CLOUD_PGPS
+	bool "OSCORE predicted-GNSS (P-GPS) client"
+	help
+	  Build the OSCORE predicted-GNSS client that fetches multi-day predicted
+	  GPS assistance (POST /p, CBOR over Block2), stores the returned 4 h
+	  ephemeris windows, and injects the window covering the current time into
+	  the nRF modem GNSS core. With OSCORE_CLOUD_PGPS_STORE the windows go to a
+	  flash ring and survive reboots; without it they are RAM-held for the
+	  current power cycle only.
+
+if OSCORE_CLOUD_PGPS
+
+config OSCORE_CLOUD_PGPS_WINDOW_COUNT_DEFAULT
+	int "Default number of predicted windows to request"
+	default 6
+	help
+	  Number of consecutive 4 h windows (request field "n") pgps_client_fetch()
+	  asks for when the caller does not override it. 6 windows = 24 h of
+	  predicted assistance. The server clamps to the available horizon.
+
+config OSCORE_CLOUD_PGPS_STORE
+	bool "Keep predicted windows in a flash ring"
+	depends on FLASH && FLASH_MAP
+	default y if $(dt_nodelabel_enabled,pgps_storage)
+	help
+	  Store downloaded windows in a dedicated flash partition (devicetree
+	  nodelabel "pgps_storage") instead of RAM, so a multi-day horizon survives
+	  reboots and a device can fix from stored predictions while offline. One
+	  4 kB flash sector holds one window; the partition is used as a ring
+	  indexed by the window number, so slots expire on their own. Without this,
+	  windows live in RAM for the current power cycle only.
+
+	  Defaults on only when the board actually defines a pgps_storage
+	  partition, since the store references that nodelabel directly.
+
+config OSCORE_CLOUD_PGPS_STORE_SLOTS
+	int "Predicted-window flash ring length"
+	depends on OSCORE_CLOUD_PGPS_STORE
+	range 6 168
+	default 84
+	help
+	  Number of 4 h window slots in the ring, which is also the horizon it can
+	  hold: 84 slots = 14 days = 336 kB of flash (4 kB per slot). The
+	  pgps_storage partition must be at least this large.
+
+config OSCORE_CLOUD_PGPS_MAX_WINDOWS
+	int "Maximum predicted windows held in RAM"
+	depends on !OSCORE_CLOUD_PGPS_STORE
+	default 6
+	help
+	  Sizes the static in-RAM window array used when there is no flash ring.
+	  Each slot holds up to a full GPS constellation of compact ephemerides
+	  (~2.3 kB), so keep this modest; windows beyond this count in a response
+	  are decoded past but not stored. With OSCORE_CLOUD_PGPS_STORE the array
+	  is not built at all -- the client keeps only a decode staging buffer and
+	  an injection cache, and the horizon is bounded by the ring instead.
+
+config OSCORE_CLOUD_PGPS_FETCH_BATCH
+	int "Maximum predicted windows per /p request"
+	range 1 12
+	default 6
+	help
+	  Upper bound on how many 4 h windows one POST /p asks for. A long horizon
+	  cannot arrive in a single response: 84 windows is ~97 kB, far past the
+	  Block2 accumulation buffer and the server's per-device response cache. A
+	  fetch for more than this many windows is therefore split into a sequence
+	  of requests with an advancing "from", one request per pgps_client_step()
+	  call, so the caller's loop keeps servicing other traffic in between.
+
+	  This is only a ceiling. The client lowers it to whatever it expects to
+	  fit the accumulation buffer, which depends on how many satellites a
+	  window carries: a pruned window holds 12-16, while an unpruned ("all")
+	  fetch returns the full constellation and costs about twice as much. If a
+	  response overflows the buffer anyway, the batch is halved and retried, so
+	  a bad estimate costs a round trip rather than the whole run.
+
+endif # OSCORE_CLOUD_PGPS
+
 config OSCORE_CLOUD_BACKOFF_INITIAL_SECONDS
 	int "Default initial reconnection backoff (seconds)"
 	default 60

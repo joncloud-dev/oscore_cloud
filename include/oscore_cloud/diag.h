@@ -52,6 +52,8 @@ enum diag_reset_reason {
 				       * NS crash capture is possible, so this is
 				       * only recorded when the intent was set
 				       * before the fault (e.g. `diag fault secure`) */
+	DIAG_RESET_AT_MONITOR_HEAP = 11, /* at_monitor heap exhausted in the IPC ISR
+					    * (__ASSERT at at_monitor.c heap alloc) */
 };
 
 /* Composed at boot from the hwinfo reset cause and the retained app intent. */

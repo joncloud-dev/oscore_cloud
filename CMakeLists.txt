@@ -38,6 +38,8 @@ zephyr_library_sources(
 )
 zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_FOTA    src/fota_client.c)
 zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_AGNSS   src/agnss_client.c)
+zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_PGPS    src/pgps_client.c)
+zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_PGPS_STORE src/pgps_store.c)
 zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_SESSION src/cloud_session.c)
 
 # Device observability collector + bridge (reboot reasons, vitals, crash

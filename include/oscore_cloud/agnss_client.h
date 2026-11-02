@@ -25,6 +25,7 @@ struct agnss_fetch_opts {
 	uint32_t window_s; /* look-ahead window (s); 0 = single-shot / instant */
 	uint8_t max_sv;    /* cap on returned satellites; 0 = uncapped */
 	uint8_t encoding;  /* 0 = text-key maps, 1 = compact positional arrays */
+	bool all;          /* "all": skip server pruning, return the full constellation */
 
 	/* Coarse position hint (most precise). */
 	bool have_pos;

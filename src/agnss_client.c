@@ -103,6 +103,9 @@ static size_t build_request(uint8_t *buf, size_t bufsz, uint32_t mask,
 	if (o->max_sv > 0) {
 		n++;
 	}
+	if (o->all) {
+		n++;
+	}
 	if (pos) {
 		n += 3; /* lat, lon, unc */
 	} else if (cell) {
@@ -129,6 +132,10 @@ static size_t build_request(uint8_t *buf, size_t bufsz, uint32_t mask,
 	if (o->max_sv > 0) {
 		off += cbor_write_tstr(buf + off, "n", 1);
 		off += cbor_write_uint(buf + off, o->max_sv);
+	}
+	if (o->all) {
+		off += cbor_write_tstr(buf + off, "all", 3);
+		off += cbor_write_bool(buf + off, true);
 	}
 	if (pos) {
 		off += cbor_write_tstr(buf + off, "lat", 3);
