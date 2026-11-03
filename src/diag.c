@@ -628,7 +628,11 @@ static bool fatal_is_at_monitor_heap(unsigned int reason, const struct arch_esf 
 
 	if (esf != NULL) {
 		lr = esf->basic.lr;
-	} else {
+	}
+#if defined(CONFIG_DEBUG_COREDUMP)
+	/* z_arm_coredump_fault_sp only exists when the coredump subsystem is
+	 * linked in; without it, a NULL esf simply cannot be classified. */
+	else {
 		extern uint32_t z_arm_coredump_fault_sp;
 		const uint32_t *sp = (const uint32_t *)(uintptr_t)z_arm_coredump_fault_sp;
 
@@ -636,6 +640,7 @@ static bool fatal_is_at_monitor_heap(unsigned int reason, const struct arch_esf 
 			lr = sp[0];
 		}
 	}
+#endif
 
 	{
 		uintptr_t base = (uintptr_t)(void *)&at_monitor_dispatch;

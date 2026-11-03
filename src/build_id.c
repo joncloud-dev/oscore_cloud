@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <app_version.h>
+#include <zephyr/app_version.h>
 
 #include <oscore_cloud/build_id.h>
 
