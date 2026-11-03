@@ -43,10 +43,8 @@ LOG_MODULE_REGISTER(agnss_client, CONFIG_OSCORE_CLOUD_LOG_LEVEL);
 static uint8_t resp_buf[8192];
 static size_t resp_len;
 
-/* SZX 5 = 512 B blocks. 1024 B (SZX 6) was tried but the OSCORE response fails
- * to decrypt (psa_aead_decrypt -> unexpected_result_from_ext_lib, surfaced as
- * -3); 512 B is the proven-good size shared with the FOTA download path. */
-#define AGNSS_BLOCK2_SZX 5
+/* Block2 size shared with the FOTA and P-GPS downloads (see the Kconfig help). */
+#define AGNSS_BLOCK2_SZX CONFIG_OSCORE_CLOUD_BLOCK2_SZX
 
 /* ---- request build ------------------------------------------------------ */
 

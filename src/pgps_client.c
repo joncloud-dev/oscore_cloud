@@ -44,9 +44,8 @@ LOG_MODULE_REGISTER(pgps_client, CONFIG_OSCORE_CLOUD_LOG_LEVEL);
  * (time.Now().Unix() - 315964800). */
 #define PGPS_GPS_EPOCH_UNIX_MS 315964800000LL
 
-/* SZX 5 = 512 B blocks: the proven-good OSCORE Block2 size shared with A-GNSS
- * and FOTA (1024 B triggers a decrypt failure, see agnss_client.c). */
-#define PGPS_BLOCK2_SZX 5
+/* Block2 size shared with the A-GNSS and FOTA downloads (see the Kconfig help). */
+#define PGPS_BLOCK2_SZX CONFIG_OSCORE_CLOUD_BLOCK2_SZX
 
 /* Block2 response accumulation buffer. A pruned window is ~16 SV * ~78 B ~=
  * 1.3 KiB, so a six-window batch reaches ~8 KiB; size for headroom. This bounds

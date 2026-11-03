@@ -34,6 +34,20 @@ config OSCORE_USE_EDHOC
 	  When enabled, the application must provide edhoc_credentials.h. Leave
 	  disabled to use the bench-provisioned opaque-key context (the default).
 
+config OSCORE_CLOUD_BLOCK2_SZX
+	int "Block2 download block size exponent (SZX)"
+	range 0 6
+	default 6
+	help
+	  CoAP block size exponent for the OSCORE Block2 downloads (FOTA image,
+	  A-GNSS, P-GPS): block size = 16 << SZX bytes. 6 (1024 B, the CoAP-over-UDP
+	  maximum) halves the round-trips compared with 5 (512 B).
+
+	  1024 B needs a server with go-coap's automatic outer block-wise transfer
+	  disabled. Older servers re-fragment any OSCORE ciphertext of 1024 B or more
+	  with an outer Block2 option that this client does not reassemble, and every
+	  block then fails to decrypt (uoscore error -3). Set 5 for those servers.
+
 config OSCORE_CLOUD_SESSION
 	bool "Connection / session helper"
 	default y

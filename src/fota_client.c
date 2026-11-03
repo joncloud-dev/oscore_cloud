@@ -83,13 +83,11 @@ LOG_MODULE_REGISTER(fota_client, LOG_LEVEL_INF);
  * (APP_STORAGE_SESSION_TIMEOUT_SECONDS, 30 s) if that pickup never happens —
  * dropping the telemetry sample.
  *
- * Blocks are 512 B (see g_block_szx; 1024 B requires OSCORE_MAX_PLAINTEXT_LEN
- * to be raised to 1536 in the uoscore build, else decrypt overruns the buffer).
- * On a degraded
- * LTE-M link a block runs ~1.5 s and up to ~10 s on a single lost datagram
+ * Blocks are CONFIG_OSCORE_CLOUD_BLOCK2_SZX sized (1024 B by default). On a
+ * degraded LTE-M link a block runs ~1.5 s and up to ~10 s on a single lost datagram
  * (BLOCK2_RECV_TIMEOUT_MS before retransmit). At 8 blocks/step that put a step
  * at 12-30+ s and routinely tripped the 30 s session timeout. Keeping it small
- * (2 blocks ≈ 1 KB, a few seconds even with one retransmit) keeps the pickup
+ * (2 blocks, a few seconds even with one retransmit) keeps the pickup
  * latency comfortably under the session timeout; the extra zbus re-posts are
  * cheap and FOTA throughput is unchanged. */
 #define FOTA_BLOCKS_PER_STEP 2
@@ -925,6 +923,31 @@ static int fota_dl_begin(const struct cloud_fota_notice *notice)
 		offset = 0;
 	}
 
+	/* Block size from CONFIG_OSCORE_CLOUD_BLOCK2_SZX (1024 B by default; see the
+	 * Kconfig help for the server requirement). A resumed download restarts at
+	 * block offset / block_size, so the offset must be block-aligned or bytes
+	 * already in the slot would be written twice. An offset persisted by a
+	 * smaller-block build (e.g. 512 B, before an update raised the size) may not
+	 * be, so step the block size down until it divides the offset.
+	 */
+	g_block_szx = CONFIG_OSCORE_CLOUD_BLOCK2_SZX;
+	while (g_block_szx > 0 && (offset % (16U << g_block_szx)) != 0) {
+		g_block_szx--;
+	}
+	if (offset % (16U << g_block_szx) != 0) {
+		LOG_WRN("FOTA resume offset %u not 16 B aligned, restarting",
+			(unsigned)offset);
+		(void)dfu_target_reset();
+		err = dfu_target_init(dfu_type, 0, notice->size, fota_dfu_target_cb);
+		if (err) {
+			LOG_ERR("dfu_target_init (realign) failed: %d", err);
+			return err;
+		}
+		offset = 0;
+		g_block_szx = CONFIG_OSCORE_CLOUD_BLOCK2_SZX;
+	}
+	g_block_size = 1U << (g_block_szx + 4);
+
 #ifdef CONFIG_DFU_TARGET_MCUBOOT
 	if (dfu_type == DFU_TARGET_IMAGE_TYPE_MCUBOOT && offset == 0) {
 		erase_secondary_trailer();
@@ -939,18 +962,6 @@ static int fota_dl_begin(const struct cloud_fota_notice *notice)
 		}
 	}
 
-	/* SZX 5 = 512 B blocks. SZX 6 (1024 B) halves the round-trips but requires
-	 * uoscore's plaintext output buffer (OSCORE_MAX_PLAINTEXT_LEN) to be raised
-	 * from its 1064 default to 1536; when that build override is not applied to
-	 * the uoscore-uedhoc library, decrypting a 1024 B Block2 body overruns the
-	 * buffer and PSA psa_aead_decrypt returns BUFFER_TOO_SMALL, surfaced as
-	 * oscore2coap -> unexpected_result_from_ext_lib (err 3) on every block. A
-	 * 512 B body fits the default buffer, so this is the safe, always-working
-	 * choice. Bump back to 6 only once OSCORE_MAX_PLAINTEXT_LEN=1536 is verified
-	 * to reach the uoscore library in the build.
-	 */
-	g_block_szx = 5;
-	g_block_size = 1U << (g_block_szx + 4);
 	g_next_block = (uint32_t)(offset / g_block_size);
 
 	memset(&g_dl, 0, sizeof(g_dl));
