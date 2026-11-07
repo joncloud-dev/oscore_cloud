@@ -20,9 +20,11 @@
 #if defined(CONFIG_OSCORE_CLOUD_DIAG_CRASH)
 #include <zephyr/fatal.h>
 #endif
+#include <zephyr/logging/log_ctrl.h>
+#include <zephyr/logging/log_backend.h>
+#include <zephyr/drivers/uart.h>
 #if defined(CONFIG_OSCORE_CLOUD_DIAG_CRASH) || defined(CONFIG_OSCORE_CLOUD_DIAG_LIVENESS)
 #include <zephyr/sys/reboot.h>
-#include <zephyr/logging/log_ctrl.h>
 #endif
 #if defined(CONFIG_DEBUG_COREDUMP)
 #include <zephyr/debug/coredump.h>
@@ -34,6 +36,7 @@
 #endif
 
 #include <oscore_cloud/diag.h>
+#include "diag_priv.h"
 
 LOG_MODULE_REGISTER(diag, CONFIG_OSCORE_CLOUD_DIAG_LOG_LEVEL);
 
@@ -69,15 +72,31 @@ static bool g_boot_pending;
 /* "BCRB": the snapshot of the log ring is captured at crash time. */
 #define BC_SNAP_MAGIC 0x42435242U
 #define BC_SIZE       CONFIG_OSCORE_CLOUD_DIAG_BREADCRUMB_SIZE
+#define LOG_RING_SIZE CONFIG_OSCORE_CLOUD_DIAG_LOG_RING_SIZE
 
-/* Live ring, plain .bss: zeroed at every boot so it only ever holds the current
- * boot's log tail. A byte ring (head = next write, len = valid bytes). */
-static uint8_t bc_live[BC_SIZE];
-static uint16_t bc_head;
-static uint16_t bc_len;
+/* Live log ring, plain .bss (zeroed every boot, so it only holds this boot's
+ * log tail). Exported under a fixed name with a self-describing header so the
+ * server can locate it in a RAM coredump via the ELF symbol table and decode it
+ * without knowing this build's Kconfig. Layout is a wire contract (version 1):
+ * buf[] is a byte ring, `head` = next write index, `len` = valid bytes. */
+#define LOG_RING_MAGIC   0x474F4C4FU /* "OLOG" */
+#define LOG_RING_VERSION 1U
 
-/* Crash snapshot, __noinit: the fatal handler linearises the live ring into here
- * (oldest first) so it survives the warm reset and the next boot can upload it.
+struct oscore_diag_log_ring {
+	uint32_t magic;
+	uint16_t version;
+	uint16_t hdr_size;   /* offsetof(buf) */
+	uint32_t size;       /* sizeof(buf) */
+	uint32_t head;
+	uint32_t len;
+	uint32_t boot_count; /* boot whose lines these are */
+	uint8_t buf[LOG_RING_SIZE];
+};
+
+__used struct oscore_diag_log_ring oscore_diag_log_ring;
+
+/* Crash snapshot, __noinit: the fatal handler copies the ring's tail in here
+ * (oldest first) so it survives the warm reset and rides the inline crash report.
  * Independent of the live ring, so boot-time logging never clobbers it. */
 static __noinit struct diag_bc_snap {
 	uint32_t magic;
@@ -94,6 +113,9 @@ static uint32_t bc_snap_crc(void)
 	return crc32_ieee((const uint8_t *)&bc_snap, offsetof(struct diag_bc_snap, crc));
 }
 #endif /* CONFIG_OSCORE_CLOUD_DIAG_BREADCRUMBS */
+
+/* Crash metadata (layout + wire contract in diag_priv.h). */
+__used struct oscore_diag_crash_meta oscore_diag_crash_meta;
 
 /* CRC over every byte of `retained` up to (not including) the crc field. */
 static uint32_t retained_crc(void)
@@ -118,7 +140,9 @@ static void retained_commit(void)
 static uint8_t reason_from_hwinfo(uint32_t cause)
 {
 	if (cause & RESET_WATCHDOG) {
-		return DIAG_RESET_WATCHDOG;
+		/* No intent was retained, so neither the task watchdog nor the
+		 * pre-watchdog caught the hang before the HW WDT reset. */
+		return DIAG_RESET_WATCHDOG_HW_SILENT;
 	}
 	if (cause & RESET_BROWNOUT) {
 		return DIAG_RESET_BROWNOUT;
@@ -160,6 +184,10 @@ static void liveness_timeout_work_fn(struct k_work *work)
 	LOG_ERR("No successful cloud contact in %d s; rebooting to recover",
 		CONFIG_OSCORE_CLOUD_DIAG_LIVENESS_TIMEOUT_SECONDS);
 
+#if defined(CONFIG_OSCORE_CLOUD_DIAG_WATCHDOG)
+	/* Through the fatal path, so the stall leaves a coredump + log ring. */
+	diag_watchdog_liveness();
+#endif
 	/* Attribute the imminent reboot so the next boot report explains it. */
 	diag_set_reboot_reason(DIAG_RESET_WATCHDOG);
 
@@ -176,6 +204,31 @@ static void liveness_kick(void)
 		K_SECONDS(CONFIG_OSCORE_CLOUD_DIAG_LIVENESS_TIMEOUT_SECONDS));
 }
 #endif /* CONFIG_OSCORE_CLOUD_DIAG_LIVENESS */
+
+static void crash_meta_init(void)
+{
+	struct oscore_diag_crash_meta *m = &oscore_diag_crash_meta;
+
+	memset(m, 0, sizeof(*m));
+	m->magic = CRASH_META_MAGIC;
+	m->version = CRASH_META_VERSION;
+	m->size = sizeof(*m);
+	m->boot_count = g_boot.boot_count;
+	m->prev_reset_reason = g_boot.reason;
+	m->wdt_channel = 0xFFU;
+#if defined(CONFIG_OSCORE_CLOUD_DIAG_BUILD_ID)
+	m->build_id_valid = (app_build_id_get(m->build_id) == 0);
+	strncpy(m->fw_version, app_fw_version(), sizeof(m->fw_version) - 1);
+#endif
+#if defined(CONFIG_OSCORE_CLOUD_DIAG_BREADCRUMBS)
+	oscore_diag_log_ring.boot_count = g_boot.boot_count;
+#endif
+}
+
+uint32_t diag_boot_count_current(void)
+{
+	return oscore_diag_crash_meta.boot_count;
+}
 
 void diag_boot_process(void)
 {
@@ -215,6 +268,7 @@ void diag_boot_process(void)
 #endif
 
 	g_boot_pending = true;
+	crash_meta_init();
 
 	LOG_INF("Boot #%u: hw_cause=0x%08x reason=%u prev_uptime=%us crash_pending=%d",
 		g_boot.boot_count, g_boot.hw_cause, g_boot.reason,
@@ -258,13 +312,21 @@ void diag_set_reboot_reason(enum diag_reset_reason reason)
 {
 	/* diag_boot_process() runs first and leaves the region valid, but guard
 	 * against a caller before init by re-establishing the magic. */
+	diag_retained_set_reason((uint8_t)reason);
+	LOG_DBG("Planned reboot reason set: %u", (unsigned int)reason);
+}
+
+void diag_retained_set_reason(uint8_t reason)
+{
 	if (!retained_valid()) {
 		memset(&retained, 0, sizeof(retained));
 		retained.pending_reason = DIAG_REASON_NONE;
 	}
-	retained.pending_reason = (uint8_t)reason;
+	retained.pending_reason = reason;
+	/* prev_uptime in the next boot report is the uptime at the reset, not
+	 * at the last cloud contact. */
+	retained.uptime_s = (uint32_t)k_uptime_seconds();
 	retained_commit();
-	LOG_DBG("Planned reboot reason set: %u", (unsigned int)reason);
 }
 
 void diag_heartbeat(void)
@@ -279,6 +341,7 @@ void diag_heartbeat(void)
 	}
 	retained.uptime_s = (uint32_t)k_uptime_seconds();
 	retained_commit();
+	oscore_diag_crash_meta.last_contact_s = retained.uptime_s;
 }
 
 /* ---- Vitals (Phase 2) ---------------------------------------------------- */
@@ -491,36 +554,55 @@ void diag_crash_clear(void)
 
 #if defined(CONFIG_OSCORE_CLOUD_DIAG_BREADCRUMBS)
 
+/* Monotonic count of bytes ever appended (not part of the wire struct). */
+static uint32_t bc_written;
+
 /* Append formatted log bytes into the live ring, overwriting the oldest data
  * once full. Called from the log backend's output path (and, during a panic,
  * synchronously), so keep it short and interrupt-safe. */
 static void bc_live_append(const uint8_t *data, size_t len)
 {
+	struct oscore_diag_log_ring *r = &oscore_diag_log_ring;
 	unsigned int key = irq_lock();
 
-	for (size_t i = 0; i < len; i++) {
-		bc_live[bc_head] = data[i];
-		bc_head = (uint16_t)((bc_head + 1U) % BC_SIZE);
-		if (bc_len < BC_SIZE) {
-			bc_len++;
-		}
+	if (r->magic != LOG_RING_MAGIC) {
+		r->version = LOG_RING_VERSION;
+		r->hdr_size = offsetof(struct oscore_diag_log_ring, buf);
+		r->size = LOG_RING_SIZE;
+		r->head = 0;
+		r->len = 0;
+		r->magic = LOG_RING_MAGIC;
 	}
+	for (size_t i = 0; i < len; i++) {
+		r->buf[r->head] = data[i];
+		r->head = (r->head + 1U) % LOG_RING_SIZE;
+	}
+	r->len = MIN(r->len + len, (uint32_t)LOG_RING_SIZE);
+	bc_written += len;
 	irq_unlock(key);
 }
 
-/* Capture the live ring into the retained snapshot, linearised oldest-first, so
- * the next boot can read a contiguous breadcrumb trail. Invoked from the fatal
- * handler before the reset. */
+/* Copy the ring's most recent BC_SIZE bytes into the retained snapshot, oldest
+ * first, starting at a line boundary when possible. Fatal handler only. */
 static void bc_capture(void)
 {
+	const struct oscore_diag_log_ring *r = &oscore_diag_log_ring;
 	unsigned int key = irq_lock();
-	uint16_t n = bc_len;
-	uint16_t start = (bc_len == BC_SIZE) ? bc_head : 0U;
+	uint32_t n = MIN(r->len, (uint32_t)BC_SIZE);
+	uint32_t start = (r->head + LOG_RING_SIZE - n) % LOG_RING_SIZE;
+	uint32_t skip = 0;
 
-	for (uint16_t i = 0; i < n; i++) {
-		bc_snap.buf[i] = bc_live[(start + i) % BC_SIZE];
+	/* Drop a leading partial line if a full one follows. */
+	if (n < r->len) {
+		while (skip < n && r->buf[(start + skip) % LOG_RING_SIZE] != '\n') {
+			skip++;
+		}
+		skip = (skip < n) ? skip + 1U : 0U;
 	}
-	bc_snap.len = n;
+	for (uint32_t i = skip; i < n; i++) {
+		bc_snap.buf[i - skip] = r->buf[(start + i) % LOG_RING_SIZE];
+	}
+	bc_snap.len = (uint16_t)(n - skip);
 	bc_snap.magic = BC_SNAP_MAGIC;
 	bc_snap.crc = bc_snap_crc();
 	irq_unlock(key);
@@ -557,9 +639,10 @@ static void bc_backend_process(const struct log_backend *const backend,
 			       union log_msg_generic *msg)
 {
 	ARG_UNUSED(backend);
-	/* Compact, self-contained lines: level + module + message, no colour or
-	 * timestamp, to stretch the small retained ring across more events. */
-	uint32_t flags = LOG_OUTPUT_FLAG_LEVEL;
+	/* Self-contained lines: uptime timestamp + level + module + message, no
+	 * colour. The 8 KiB ring holds a few hundred lines. */
+	uint32_t flags = LOG_OUTPUT_FLAG_LEVEL | LOG_OUTPUT_FLAG_TIMESTAMP |
+			 LOG_OUTPUT_FLAG_FORMAT_TIMESTAMP;
 
 	log_output_msg_process(&bc_log_output, &msg->log, flags);
 }
@@ -590,6 +673,75 @@ static const struct log_backend_api bc_backend_api = {
 LOG_BACKEND_DEFINE(diag_bc_backend, bc_backend_api, true);
 
 #endif /* CONFIG_OSCORE_CLOUD_DIAG_BREADCRUMBS */
+
+/* ---- Coredump pre-capture: logs into the ring, console after the dump ----- */
+
+static bool g_precaptured;
+#if defined(CONFIG_OSCORE_CLOUD_DIAG_BREADCRUMBS)
+static uint32_t g_replay_from; /* bc_written when the flush started */
+#endif
+
+void diag_coredump_pre_capture(void)
+{
+	/* Runs from the coredump backend's start hook: inside the fatal path, before
+	 * any memory is dumped and before k_sys_fatal_error_handler. Flush the
+	 * deferred log queue so the last lines (incl. Zephyr's own fault report)
+	 * land in the RAM log ring and therefore in the dump.
+	 *
+	 * Only the ring backend stays active for this flush. On nRF91 a BusFault is
+	 * taken by TF-M first (which prints on the shared UART0) and then forwarded;
+	 * a non-secure UARTE poll-out at that point faults again and TF-M resets the
+	 * SoC, which would lose the dump. The console gets the same lines afterwards
+	 * via diag_console_replay(), once the dump is safely stored. */
+	diag_prewdt_disarm(); /* the dump write feeds the HW WDT itself */
+#if defined(CONFIG_OSCORE_CLOUD_DIAG_BREADCRUMBS)
+	STRUCT_SECTION_FOREACH(log_backend, b) {
+		if (b != &diag_bc_backend) {
+			log_backend_deactivate(b);
+		}
+	}
+	g_replay_from = bc_written;
+#endif
+	LOG_PANIC();
+	oscore_diag_crash_meta.captured = 1U;
+	g_precaptured = true;
+}
+
+#if defined(CONFIG_OSCORE_CLOUD_DIAG_CRASH)
+static void console_puts(const char *s, size_t n)
+{
+#if DT_HAS_CHOSEN(zephyr_console)
+	const struct device *con = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+
+	if (!device_is_ready(con)) {
+		return;
+	}
+	for (size_t i = 0; i < n; i++) {
+		if (s[i] == '\n') {
+			uart_poll_out(con, '\r');
+		}
+		uart_poll_out(con, s[i]);
+	}
+#else
+	ARG_UNUSED(s);
+	ARG_UNUSED(n);
+#endif
+}
+
+/* Best-effort: echo the lines the pre-capture flush diverted into the ring. */
+static void diag_console_replay(void)
+{
+#if defined(CONFIG_OSCORE_CLOUD_DIAG_BREADCRUMBS)
+	const struct oscore_diag_log_ring *r = &oscore_diag_log_ring;
+	uint32_t n = MIN(bc_written - g_replay_from, r->len);
+	uint32_t start = (r->head + LOG_RING_SIZE - n) % LOG_RING_SIZE;
+
+	for (uint32_t i = 0; i < n; i++) {
+		console_puts((const char *)&r->buf[(start + i) % LOG_RING_SIZE], 1);
+	}
+#endif
+}
+#endif /* CONFIG_OSCORE_CLOUD_DIAG_CRASH */
 
 const char *diag_breadcrumbs_get(uint16_t *len)
 {
@@ -713,6 +865,7 @@ static void diag_crash_capture(unsigned int reason, const struct arch_esf *esf)
 			retained.pending_reason = DIAG_RESET_FATAL;
 		}
 	}
+	retained.uptime_s = (uint32_t)k_uptime_seconds();
 	retained_commit();
 
 #if defined(CONFIG_OSCORE_CLOUD_DIAG_BREADCRUMBS)
@@ -726,8 +879,18 @@ static void diag_crash_capture(unsigned int reason, const struct arch_esf *esf)
 void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
 {
 	diag_crash_capture(reason, esf);
-	LOG_PANIC();
-	LOG_ERR("Fatal error %u captured; rebooting", reason);
+	if (g_precaptured) {
+		/* The coredump is stored; the logs went only to the ring. */
+		char line[48];
+		int n = snprintk(line, sizeof(line), "diag: fatal error %u captured; rebooting\n",
+				 reason);
+
+		diag_console_replay();
+		console_puts(line, MAX(n, 0));
+	} else {
+		LOG_PANIC();
+		LOG_ERR("Fatal error %u captured; rebooting", reason);
+	}
 	sys_reboot(SYS_REBOOT_COLD);
 	CODE_UNREACHABLE;
 }
@@ -779,6 +942,13 @@ void diag_coredump_erase(void)
 #if defined(CONFIG_DEBUG_COREDUMP)
 	(void)coredump_cmd(COREDUMP_CMD_ERASE_STORED_DUMP, NULL);
 #endif
+}
+
+/* Backends that can describe their slot (coredump_backend_spi_nor.c) override. */
+__weak int diag_coredump_info(struct diag_coredump_info *info)
+{
+	ARG_UNUSED(info);
+	return -ENOTSUP;
 }
 
 /* ---- Shell: fault injection & inspection --------------------------------- */
@@ -863,21 +1033,26 @@ static int cmd_diag_reboot(const struct shell *sh, size_t argc, char **argv)
 }
 
 /* Recurse with a per-frame buffer the optimiser must keep, to blow the thread
- * stack and trip the MPU stack guard. */
-static uint32_t diag_recurse(uint32_t depth)
+ * stack and trip the stack guard (PSPLIM). Each frame's buffer address is
+ * passed to the callee and read again after the call returns, so the frame
+ * must stay live: GCC can neither tail-call it nor turn it into an accumulator
+ * loop (which the old `pad[0] + diag_recurse(depth + 1)` form allowed, making
+ * `diag fault stack` spin forever instead of overflowing). */
+static uint32_t __noinline diag_recurse(uint32_t depth, volatile uint32_t *prev)
 {
 	volatile uint32_t pad[16];
 
 	for (size_t i = 0; i < ARRAY_SIZE(pad); i++) {
-		pad[i] = depth + i;
+		pad[i] = depth + i + (prev != NULL ? prev[i] : 0U);
 	}
-	diag_sink += pad[depth % ARRAY_SIZE(pad)];
-	/* Never true at runtime, but stops the optimiser from proving the
-	 * recursion is infinite (and tail-calling / warning about it). */
+	/* Never true at runtime; stops the optimiser proving infinite recursion. */
 	if (diag_sink == 0xFFFFFFFFU) {
 		return depth;
 	}
-	return pad[0] + diag_recurse(depth + 1);
+
+	uint32_t r = diag_recurse(depth + 1, pad);
+
+	return r ^ pad[r % ARRAY_SIZE(pad)];
 }
 
 /* Leaf handler: the fault kind is the subcommand name (argv[0]), e.g. the
@@ -901,7 +1076,7 @@ static int cmd_diag_fault_do(const struct shell *sh, size_t argc, char **argv)
 		volatile uint32_t *p =
 			(volatile uint32_t *)((uintptr_t)&diag_recurse & ~0x3U);
 
-		*p = 0xDEADBEEFU; /* store to read-only flash -> NS MemManage */
+		*p = 0xDEADBEEFU; /* store to read-only flash -> BusFault (forwarded by TF-M) */
 	} else if (strcmp(kind, "badjump") == 0) {
 		/* Jump into a non-secure RAM buffer (execute-never under the MPU) to
 		 * model a corrupted function pointer. The thumb bit is set so the
@@ -922,7 +1097,7 @@ static int cmd_diag_fault_do(const struct shell *sh, size_t argc, char **argv)
 		k_sleep(K_MSEC(50));
 		*p = 0xDEADBEEFU; /* store to secure region -> SecureFault (TF-M) */
 	} else if (strcmp(kind, "stack") == 0) {
-		diag_sink = diag_recurse(0);
+		diag_sink = diag_recurse(0, NULL);
 	} else if (strcmp(kind, "oops") == 0) {
 		k_oops();
 	} else if (strcmp(kind, "panic") == 0) {
@@ -935,9 +1110,22 @@ static int cmd_diag_fault_do(const struct shell *sh, size_t argc, char **argv)
 		k_panic();
 #endif
 	} else if (strcmp(kind, "unaligned") == 0) {
-		volatile uint32_t *p = (volatile uint32_t *)0x20000001U;
+		/* Cortex-M33 performs unaligned LDR/STR unless CCR.UNALIGN_TRP is
+		 * set, and setting it globally makes the fault handlers themselves
+		 * fault (nested fault -> secure HardFault, no dump). LDRD always
+		 * faults on an unaligned address, so use it on an odd address inside
+		 * an NS RAM buffer (0x20000001 would be TF-M's secure RAM and give a
+		 * forwarded SecureFault instead). */
+		static volatile uint32_t buf[3];
+		uintptr_t a = (uintptr_t)buf + 1U;
+#if defined(CONFIG_CPU_CORTEX_M)
+		uint32_t lo, hi;
 
-		diag_sink = *p; /* unaligned word access -> usage fault */
+		__asm__ volatile("ldrd %0, %1, [%2]" : "=r"(lo), "=r"(hi) : "r"(a) : "memory");
+		diag_sink = lo ^ hi; /* -> UsageFault (UNALIGNED) */
+#else
+		diag_sink = *(volatile uint32_t *)a;
+#endif
 	}
 
 	shell_warn(sh, "fault did not trip (config-dependent); try another");
@@ -953,6 +1141,102 @@ static int cmd_diag_fault(const struct shell *sh, size_t argc, char **argv)
 	return -EINVAL;
 }
 
+#if defined(CONFIG_OSCORE_CLOUD_DIAG_WATCHDOG)
+#include <zephyr/task_wdt/task_wdt.h>
+
+/* Spare IRQ line for `diag hang isr`: TIMER2's vector, unless something owns
+ * TIMER2. A board may mark the node "okay" with no driver behind it (the
+ * Thingy:91 X enables all three TIMERs), so the test is "no driver uses it",
+ * not "the node is disabled". Should another user connect the IRQ anyway, the
+ * static ISR table rejects the duplicate at build time. */
+#if DT_NODE_EXISTS(DT_NODELABEL(timer2)) && !defined(CONFIG_NRF_TIMER2_SECURE) && \
+	!defined(CONFIG_NRFX_TIMER2) && \
+	!(DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(timer2)) && defined(CONFIG_COUNTER))
+#define DIAG_HANG_IRQ DT_IRQN(DT_NODELABEL(timer2))
+#endif
+
+static K_SEM_DEFINE(diag_hang_never, 0, 1);
+
+static void diag_hang_wdt_cb(int channel_id, void *user_data)
+{
+	diag_watchdog_trigger(channel_id, user_data);
+}
+
+/* The spin the pre-watchdog must catch: no feed, no scheduler, no timer ISR. */
+static void __noinline diag_hang_spin(void)
+{
+	for (;;) {
+		diag_sink++;
+	}
+}
+
+#if defined(DIAG_HANG_IRQ)
+static void diag_hang_isr(const void *arg)
+{
+	ARG_UNUSED(arg);
+	diag_hang_spin(); /* never returns: starves every lower-priority IRQ */
+}
+#endif
+
+static int cmd_diag_hang_do(const struct shell *sh, size_t argc, char **argv)
+{
+	const char *kind = argv[0];
+
+	ARG_UNUSED(argc);
+	if (strcmp(kind, "thread") == 0) {
+		int ch = task_wdt_add(CONFIG_TASK_WDT_MIN_TIMEOUT, diag_hang_wdt_cb,
+				      (void *)k_current_get());
+
+		if (ch < 0) {
+			shell_error(sh, "task_wdt_add failed: %d", ch);
+			return ch;
+		}
+		shell_print(sh, "hang 'thread': task_wdt channel %d, %u ms, never fed", ch,
+			    CONFIG_TASK_WDT_MIN_TIMEOUT);
+		LOG_WRN("diag hang thread: %s blocks forever on channel %d",
+			k_thread_name_get(k_current_get()), ch);
+		(void)k_sem_take(&diag_hang_never, K_FOREVER);
+		return 0;
+	}
+
+	shell_print(sh, "hang '%s': the pre-watchdog must catch this", kind);
+	LOG_WRN("diag hang %s: spinning", kind);
+	k_sleep(K_MSEC(100)); /* let the lines reach the console and the ring */
+
+	if (strcmp(kind, "irqlock") == 0) {
+		unsigned int key = irq_lock();
+
+		ARG_UNUSED(key);
+		diag_hang_spin();
+	}
+#if defined(DIAG_HANG_IRQ)
+	if (strcmp(kind, "isr") == 0) {
+		IRQ_CONNECT(DIAG_HANG_IRQ, 0, diag_hang_isr, NULL, 0);
+		irq_enable(DIAG_HANG_IRQ);
+		NVIC_SetPendingIRQ(DIAG_HANG_IRQ);
+		k_sleep(K_FOREVER);
+	}
+#endif
+	shell_error(sh, "'%s' not available in this build", kind);
+	return -ENOTSUP;
+}
+
+static int cmd_diag_hang(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	shell_error(sh, "usage: diag hang <thread|irqlock|isr>");
+	return -EINVAL;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(
+	diag_hang_sub,
+	SHELL_CMD(thread, NULL, "Starve a task_wdt channel (task watchdog dump)", cmd_diag_hang_do),
+	SHELL_CMD(irqlock, NULL, "Spin with IRQs locked (pre-watchdog dump)", cmd_diag_hang_do),
+	SHELL_CMD(isr, NULL, "Spin in a high-priority ISR (pre-watchdog dump)", cmd_diag_hang_do),
+	SHELL_SUBCMD_SET_END);
+#endif /* CONFIG_OSCORE_CLOUD_DIAG_WATCHDOG */
+
 #if defined(CONFIG_DEBUG_COREDUMP)
 static int cmd_diag_coredump(const struct shell *sh, size_t argc, char **argv)
 {
@@ -961,20 +1245,41 @@ static int cmd_diag_coredump(const struct shell *sh, size_t argc, char **argv)
 		shell_print(sh, "coredump erased");
 		return 0;
 	}
-	shell_print(sh, "coredump: %d bytes stored", diag_coredump_size());
+	if (argc >= 2 && strcmp(argv[1], "verify") == 0) {
+		int v = coredump_cmd(COREDUMP_CMD_VERIFY_STORED_DUMP, NULL);
+
+		shell_print(sh, "coredump verify: %s (%d)", v == 1 ? "OK" : "FAIL", v);
+		return 0;
+	}
+
+	struct diag_coredump_info ci;
+	static const char *const st[] = {"clean", "pending", "dirty", "erasing"};
+
+	if (diag_coredump_info(&ci) == 0) {
+		shell_print(sh, "coredump: %s, %u / %u bytes%s, crc 0x%08x, write %u ms, dropped %u",
+			    ci.state < ARRAY_SIZE(st) ? st[ci.state] : "?", ci.size,
+			    ci.capacity, ci.truncated ? " (TRUNCATED)" : "", ci.crc, ci.write_ms,
+			    ci.dropped);
+		if (ci.state == DIAG_COREDUMP_PENDING) {
+			shell_print(sh, "          boot #%u, reason %u, build-id %s", ci.boot_count,
+				    ci.reason, ci.build_id_valid ? "set" : "none");
+		}
+	} else {
+		shell_print(sh, "coredump: %d bytes stored", diag_coredump_size());
+	}
 	return 0;
 }
 #endif
 
 SHELL_STATIC_SUBCMD_SET_CREATE(
 	diag_fault_sub,
-	SHELL_CMD(null, NULL, "Write read-only flash (NS MemManage, coredump)", cmd_diag_fault_do),
+	SHELL_CMD(null, NULL, "Write read-only flash (BusFault via TF-M, coredump)", cmd_diag_fault_do),
 	SHELL_CMD(badjump, NULL, "Execute from RAM (NS MemManage, coredump)", cmd_diag_fault_do),
 	SHELL_CMD(stack, NULL, "Overflow the stack", cmd_diag_fault_do),
 	SHELL_CMD(oops, NULL, "k_oops()", cmd_diag_fault_do),
 	SHELL_CMD(panic, NULL, "k_panic()", cmd_diag_fault_do),
 	SHELL_CMD(assert, NULL, "Forced __ASSERT", cmd_diag_fault_do),
-	SHELL_CMD(unaligned, NULL, "Unaligned access", cmd_diag_fault_do),
+	SHELL_CMD(unaligned, NULL, "Unaligned word load (UsageFault, coredump)", cmd_diag_fault_do),
 	SHELL_CMD(secure, NULL, "Secure-region write (TF-M reset, no coredump)", cmd_diag_fault_do),
 	SHELL_SUBCMD_SET_END);
 
@@ -982,9 +1287,12 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	diag_sub,
 	SHELL_CMD(info, NULL, "Show boot/crash/vitals state", cmd_diag_info),
 	SHELL_CMD(fault, &diag_fault_sub, "Inject a fault (then reboot)", cmd_diag_fault),
+#if defined(CONFIG_OSCORE_CLOUD_DIAG_WATCHDOG)
+	SHELL_CMD(hang, &diag_hang_sub, "Inject a hang (watchdog dump, then reboot)", cmd_diag_hang),
+#endif
 	SHELL_CMD_ARG(reboot, NULL, "Reboot [fota|user|software]", cmd_diag_reboot, 1, 1),
 #if defined(CONFIG_DEBUG_COREDUMP)
-	SHELL_CMD_ARG(coredump, NULL, "Show or 'erase' stored coredump", cmd_diag_coredump, 1, 1),
+	SHELL_CMD_ARG(coredump, NULL, "Show, 'verify' or 'erase' stored coredump", cmd_diag_coredump, 1, 1),
 #endif
 	SHELL_SUBCMD_SET_END);
 

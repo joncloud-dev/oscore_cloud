@@ -327,6 +327,13 @@ typedef int (*cloud_block1_source)(uint8_t *buf, size_t want, size_t offset, voi
 int cloud_client_oscore_block1_post(const char *path, size_t total_len, uint8_t szx,
 				    cloud_block1_source source, void *ctx);
 
+/** As cloud_client_oscore_block1_post(), but start at Block1 number
+ * start_block (byte offset start_block * block size) to resume an interrupted
+ * upload the server has partially stored. */
+int cloud_client_oscore_block1_post_from(const char *path, size_t total_len, uint8_t szx,
+					 uint32_t start_block, cloud_block1_source source,
+					 void *ctx);
+
 /* ------------------------------------------------------------------------
  * Lifecycle and operations
  * ------------------------------------------------------------------------ */

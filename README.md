@@ -86,9 +86,12 @@ maps, so an NTN device spends a single round-trip:
 | 22 | Minimal crash report (fault regs + stack slice + build-id + breadcrumbs) | `OSCORE_CLOUD_DIAG_CRASH` |
 | 23 | Static device info (board, modem fw, IMEI, ICCID), one-shot on connect | `OSCORE_CLOUD_DIAG_DEVICE_INFO` |
 
-The full Zephyr coredump is pulled on demand over CoAP Block1 (`POST /c`), only
-on a terrestrial bearer. See the top-level `OBSERVABILITY.md` for the wire
-protocol and the backend side.
+The full Zephyr coredump goes up as a second exchange, only on a terrestrial
+bearer: resumable and ZRL1-compressed over `POST /c/o` + `POST /c/d`, with a
+fallback to the legacy raw Block1 `POST /c` on an older server. Watchdog
+expiries (`CONFIG_OSCORE_CLOUD_DIAG_WATCHDOG`) also end in a coredump. See
+`docs/OBSERVABILITY.md` in `oscore_pocketbase` for the whole pipeline and
+`go/sdk/protocol/README.md` there for the byte-level contract.
 
 ### Usage — automatic (default)
 
@@ -143,12 +146,45 @@ if (cloud_client_post_telemetry(&t, &dl) == 0 && oneshot) {
   `<APP_VERSION_STRING>+<build-id>` as the firmware version, which needs an
   `app_version.h` — add a Zephyr `VERSION` file to the application (a build with
   no `VERSION` file reports `0.0.0`).
-- **Coredump backend**: enable one — Zephyr's in-memory backend
-  (`CONFIG_DEBUG_COREDUMP_BACKEND_IN_MEMORY`, no devicetree overlay, survives a
-  warm reset only) or the bundled fault-safe flash backend
-  (`CONFIG_DEBUG_COREDUMP_BACKEND_OTHER=y` +
-  `CONFIG_OSCORE_CLOUD_DIAG_COREDUMP_BACKEND_NVMC=y`, which needs a
-  `coredump_partition` DT nodelabel attributed non-secure on nRF91).
+- **Coredump backend**: enable one of
+  - the bundled **external SPI NOR** backend (recommended):
+    `CONFIG_DEBUG_COREDUMP_BACKEND_OTHER=y` +
+    `CONFIG_OSCORE_CLOUD_DIAG_COREDUMP_BACKEND_SPI_NOR=y`. Needs a
+    `coredump_partition` nodelabel in the fixed-partitions of a
+    `jedec,spi-nor` device on an `nordic,nrf-spim` bus, 64 KiB aligned and
+    sized (1 MiB holds a full-RAM dump: 127 KB on the nRF9151 DK, 178 KB on
+    the Thingy:91 X, written in ~0.4–0.5 s). The fault handler
+    programs it through polled SPIM register access (no RTOS), the slot is
+    pre-erased in the background after upload, a full slot truncates instead
+    of discarding, and in a crash loop the first un-uploaded dump is kept
+    (`CONFIG_OSCORE_CLOUD_DIAG_COREDUMP_KEEP_FIRST`). Shell: `diag coredump
+    [verify|erase]`.
+
+    Uploads are resumable and ZRL1-compressed (`POST /c/o` + `/c/d`, see
+    `go/sdk/protocol/README.md`; RAM dumps shrink to about a third), and fall
+    back to the legacy raw `POST /c` on an older server. Use
+    `CONFIG_DEBUG_COREDUMP_MEMORY_DUMP_LINKER_RAM=y` +
+    `CONFIG_DEBUG_COREDUMP_THREADS_METADATA=y` for a full-RAM dump: it then
+    carries the RAM log ring `oscore_diag_log_ring`
+    (`CONFIG_OSCORE_CLOUD_DIAG_LOG_RING_SIZE`, default 8 KiB, timestamped
+    lines, never written to flash on its own) and the `oscore_diag_crash_meta`
+    block (boot counter, build-id, firmware version). Deferred logs are flushed
+    into the ring before the dump is written; the console gets them afterwards.
+  - the **internal flash** backend, for boards without external flash:
+    `..._BACKEND_NVMC=y`, `coredump_partition` in internal flash attributed
+    non-secure on nRF91. It is capacity-limited (typically 32 KiB, so only a
+    THREADS-scope dump with short stack tops fits), and the whole partition
+    is erased in the fault handler.
+  - Zephyr's in-memory backend (`CONFIG_DEBUG_COREDUMP_BACKEND_IN_MEMORY`, no
+    devicetree overlay, survives a warm reset only).
+- **Watchdogs** (`CONFIG_OSCORE_CLOUD_DIAG_WATCHDOG`, needs `TASK_WDT` +
+  `TASK_WDT_HW_FALLBACK`): the library calls `task_wdt_init()` itself. Call
+  `diag_watchdog_trigger(channel, thread)` from your task_wdt callbacks; the
+  starved thread then appears as the culprit in the dump. The RTC0
+  zero-latency pre-watchdog (`_PRE_WATCHDOG`, default y) catches IRQ-locked
+  spins and runaway ISRs 2 s before the hardware WDT resets.
+  `TASK_WDT_HW_FALLBACK_DELAY` must exceed the margin plus 500 ms (a
+  BUILD_ASSERT checks this). Shell: `diag hang thread|irqlock|isr`.
 - **Vitals / device-info sources**: enable the sources you want reported —
   `CONFIG_SYS_HEAP_RUNTIME_STATS`, `CONFIG_THREAD_MONITOR` +
   `CONFIG_THREAD_STACK_INFO`, `CONFIG_THREAD_RUNTIME_STATS`, `CONFIG_MODEM_INFO`,

@@ -46,9 +46,16 @@ zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_SESSION src/cloud_session.c)
 # reports). The bridge folds the collected signals into cloud_telemetry, so it
 # depends on the wire layer above; enabling OSCORE_CLOUD_DIAG is enough.
 zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_DIAG src/diag.c src/diag_bridge.c)
+if(CONFIG_OSCORE_CLOUD_DIAG_CRASH AND CONFIG_DEBUG_COREDUMP)
+  zephyr_library_sources(src/coredump_upload.c)
+endif()
+zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_DIAG_WATCHDOG src/diag_watchdog.c)
 zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_DIAG_BUILD_ID src/build_id.c)
 zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_DIAG_COREDUMP_BACKEND_NVMC
   src/coredump_backend_nvmc.c)
+zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_DIAG_COREDUMP_BACKEND_SPI_NOR
+  src/coredump_backend_spi_nor.c
+  src/fault_spi_nor.c)
 
 # GNU build-id: a hash of the binary embedded by the linker, giving every build
 # an automatically distinct identity. Plain -Wl,--build-id conflicts with

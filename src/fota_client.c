@@ -31,6 +31,9 @@
 #include <oscore_cloud/cloud_client.h>
 #include <oscore_cloud/cloud_config.h>
 #include <oscore_cloud/cbor.h>
+#if defined(CONFIG_OSCORE_CLOUD_DIAG)
+#include <oscore_cloud/diag.h>
+#endif
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -790,6 +793,18 @@ static int fota_verify_hash(struct fota_dl_ctx *dl, const struct cloud_fota_noti
 	return 0;
 }
 
+/* Reboot into the downloaded image. The diag intent makes the next boot report
+ * reason "fota" instead of a plain software reset. */
+static void fota_reboot_to_apply(void)
+{
+#if defined(CONFIG_OSCORE_CLOUD_DIAG)
+	diag_set_reboot_reason(DIAG_RESET_FOTA);
+#endif
+	log_panic();
+	k_msleep(100);
+	sys_reboot(SYS_REBOOT_COLD);
+}
+
 static int apply_image(enum cloud_fota_image_type type)
 {
 	int err;
@@ -826,9 +841,7 @@ static int apply_image(enum cloud_fota_image_type type)
 		fota_log_secondary_trailer("after boot_request_upgrade");
 		LOG_INF("MCUboot: pending swap_type=%s(%d), rebooting to apply",
 			mcuboot_swap_type_name(mcuboot_swap_type()), mcuboot_swap_type());
-		log_panic();
-		k_msleep(100);
-		sys_reboot(SYS_REBOOT_COLD);
+		fota_reboot_to_apply();
 		break;
 	case CLOUD_FOTA_TYPE_MODEM_DELTA:
 		/* dfu_target_done(true) above finalized the write into the modem
@@ -846,13 +859,11 @@ static int apply_image(enum cloud_fota_image_type type)
 		}
 		(void)fota_settings_save(fota_job_id, FOTA_PHASE_MODEM_APPLIED);
 		LOG_INF("Modem delta scheduled; rebooting to apply");
-		log_panic();
-		k_msleep(100);
-		sys_reboot(SYS_REBOOT_COLD);
+		fota_reboot_to_apply();
 		break;
 	case CLOUD_FOTA_TYPE_MODEM_FULL:
 		LOG_INF("Full modem image downloaded; reboot to apply");
-		sys_reboot(SYS_REBOOT_COLD);
+		fota_reboot_to_apply();
 		break;
 	default:
 		return -EINVAL;

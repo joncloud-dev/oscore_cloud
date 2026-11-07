@@ -226,15 +226,6 @@ void oscore_cloud_diag_attach_clear(void)
 	diag_heartbeat();
 }
 
-#if defined(CONFIG_OSCORE_CLOUD_DIAG_CRASH) && defined(CONFIG_DEBUG_COREDUMP)
-/* Block1 upload source: pull `want` bytes of the stored coredump at `offset`. */
-static int coredump_block1_source(uint8_t *buf, size_t want, size_t offset, void *ctx)
-{
-	ARG_UNUSED(ctx);
-	return diag_coredump_read(buf, want, offset);
-}
-#endif
-
 void oscore_cloud_diag_after_send(enum cloud_transport transport)
 {
 #if defined(CONFIG_OSCORE_CLOUD_DIAG_CRASH) && defined(CONFIG_DEBUG_COREDUMP)
@@ -244,24 +235,8 @@ void oscore_cloud_diag_after_send(enum cloud_transport transport)
 		return;
 	}
 
-	int size = diag_coredump_size();
-
-	if (size <= 0) {
-		return;
-	}
-
-	LOG_INF("Uploading stored coredump (%d bytes) over Block1", size);
-
-	/* SZX 6 == 1024-byte blocks, matching the FOTA download path. */
-	int err = cloud_client_oscore_block1_post("c", (size_t)size, 6,
-						  coredump_block1_source, NULL);
-	if (err) {
-		LOG_WRN("coredump upload failed: %d (will retry next session)", err);
-		return;
-	}
-
-	diag_coredump_erase();
-	LOG_INF("Coredump uploaded and erased from flash");
+	/* Resumable + compressed (/c/o + /c/d), legacy raw /c fallback; erases on success. */
+	(void)diag_coredump_upload();
 #else
 	ARG_UNUSED(transport);
 #endif

@@ -826,13 +826,21 @@ static int block1_send_request(const char *path, uint32_t block_num, uint8_t szx
 int cloud_client_oscore_block1_post(const char *path, size_t total_len, uint8_t szx,
 				    cloud_block1_source source, void *ctx)
 {
+	return cloud_client_oscore_block1_post_from(path, total_len, szx, 0, source, ctx);
+}
+
+int cloud_client_oscore_block1_post_from(const char *path, size_t total_len, uint8_t szx,
+					 uint32_t start_block, cloud_block1_source source,
+					 void *ctx)
+{
 	const size_t block_size = (size_t)16U << (szx & 0x07U);
 	static uint8_t chunk[1024];
-	uint32_t block_num = 0;
-	size_t offset = 0;
+	uint32_t block_num = start_block;
+	size_t offset = (size_t)start_block * block_size;
 	int err;
 
-	if (!path || !source || total_len == 0 || block_size > sizeof(chunk)) {
+	if (!path || !source || total_len == 0 || block_size > sizeof(chunk) ||
+	    offset >= total_len) {
 		return -EINVAL;
 	}
 

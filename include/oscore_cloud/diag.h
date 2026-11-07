@@ -54,7 +54,20 @@ enum diag_reset_reason {
 				       * before the fault (e.g. `diag fault secure`) */
 	DIAG_RESET_AT_MONITOR_HEAP = 11, /* at_monitor heap exhausted in the IPC ISR
 					    * (__ASSERT at at_monitor.c heap alloc) */
+	DIAG_RESET_WATCHDOG_TASK = 12,   /* task_wdt channel starved; coredump taken */
+	DIAG_RESET_WATCHDOG_HW_PRE = 13, /* pre-watchdog fired ahead of the HW WDT
+					  * (IRQs locked / ISR spin); coredump taken */
+	DIAG_RESET_WATCHDOG_HW_SILENT = 14, /* HW WDT reset with no dump: nothing
+					     * caught the hang before the reset */
 };
+
+/* Zephyr fatal-error reasons raised by the watchdog paths (k_fatal_error
+ * reason, the coredump header reason and crash report fault_type). Chosen
+ * well above K_ERR_ARCH_START + the Cortex-M K_ERR_ARM_* range. Wire contract
+ * with the server (coredump.ReasonName). */
+#define DIAG_FATAL_WATCHDOG_TASK     0x100U /* task_wdt callback */
+#define DIAG_FATAL_WATCHDOG_HW       0x101U /* hardware pre-watchdog (ZLI) */
+#define DIAG_FATAL_WATCHDOG_LIVENESS 0x102U /* cloud-contact liveness */
 
 /* Composed at boot from the hwinfo reset cause and the retained app intent. */
 struct diag_boot_report {
@@ -205,6 +218,57 @@ int diag_coredump_read(uint8_t *buf, size_t want, size_t offset);
 
 /* Erase the stored coredump after a successful upload so it is not re-sent. */
 void diag_coredump_erase(void);
+
+/* Upload a stored coredump and erase it on success. Uses the resumable,
+ * compressed POST /c/o + /c/d protocol (a dropped link resumes at the next
+ * missing block in a later call) and falls back to the legacy raw POST /c when
+ * the server lacks /c/o. Blocking; call from the thread that owns the cloud
+ * socket, on a terrestrial bearer only. Returns 0 when nothing was stored or
+ * the upload completed, <0 on error (the dump stays for the next call). */
+int diag_coredump_upload(void);
+
+/* Coredump storage slot state (backend-reported). */
+enum diag_coredump_state {
+	DIAG_COREDUMP_CLEAN,   /* erased, ready for a program-only capture */
+	DIAG_COREDUMP_PENDING, /* complete dump awaiting upload */
+	DIAG_COREDUMP_DIRTY,   /* interrupted capture or discarded, needs erase */
+	DIAG_COREDUMP_ERASING, /* background erase in progress */
+};
+
+struct diag_coredump_info {
+	uint32_t capacity;  /* usable payload bytes in the slot */
+	uint32_t size;      /* stored dump bytes (PENDING only) */
+	uint32_t write_ms;  /* fault-handler write duration (PENDING only) */
+	uint32_t crc;       /* crc32_ieee of the stored dump (PENDING only) */
+	uint32_t dropped;   /* crashes not stored because a dump was pending */
+	uint32_t boot_count; /* boot that crashed (PENDING only) */
+	uint32_t reason;     /* Zephyr fatal reason from the dump header */
+	uint8_t state;       /* enum diag_coredump_state */
+	bool truncated;      /* dump hit the slot capacity */
+	bool build_id_valid;
+	uint8_t build_id[APP_BUILD_ID_LEN]; /* image that crashed */
+};
+
+/* Describe the coredump slot. Returns -ENOTSUP if the backend cannot report. */
+int diag_coredump_info(struct diag_coredump_info *info);
+
+/* ---- Watchdogs (CONFIG_OSCORE_CLOUD_DIAG_WATCHDOG) ------------------------ */
+
+/* End a task watchdog expiry in a coredump. Call it from a task_wdt callback
+ * (which runs in the system-timer ISR) with the callback's channel id and the
+ * starved thread (the user_data most callers pass to task_wdt_add). The thread
+ * is recorded as the culprit in oscore_diag_crash_meta, the reboot is
+ * attributed DIAG_RESET_WATCHDOG_TASK, and a fatal error with reason
+ * DIAG_FATAL_WATCHDOG_TASK runs Zephyr's coredump path. Does not return. */
+void diag_watchdog_trigger(int channel, void *thread);
+
+/* Boot counter of the running boot (valid after diag_boot_process()). */
+uint32_t diag_boot_count_current(void);
+
+/* Called by a coredump backend's start hook, inside the fatal path and before
+ * any memory is dumped: flushes deferred logs into the RAM log ring and marks
+ * the crash metadata captured. Not for application use. */
+void diag_coredump_pre_capture(void);
 
 #ifdef __cplusplus
 }

@@ -267,15 +267,28 @@ config OSCORE_CLOUD_DIAG_BREADCRUMBS
 	  last lines before a crash travel with the crash report (CBOR key 22 "bc")
 	  for display next to the symbolicated backtrace.
 
-config OSCORE_CLOUD_DIAG_BREADCRUMB_SIZE
-	int "Breadcrumb ring size (bytes)"
-	default 1024
+config OSCORE_CLOUD_DIAG_LOG_RING_SIZE
+	int "Live log ring size (bytes)"
+	default 8192
 	depends on OSCORE_CLOUD_DIAG_BREADCRUMBS
 	help
-	  Size of both the live log ring and the retained crash snapshot. Two buffers
-	  of this size are reserved; keep it modest to respect the small retained RAM
-	  budget and the NTN uplink (only the first 256 bytes ride the minimal report;
-	  the remainder is recoverable from the coredump).
+	  Size of the RAM log ring that holds the most recent formatted log lines
+	  (timestamp + level + module + message). It lives in ordinary RAM at the
+	  well-known symbol `oscore_diag_log_ring`, so a coredump that covers RAM
+	  carries it and the server extracts the full log tail leading up to the
+	  crash. It is never written to flash on its own (no wear); it reaches
+	  flash only inside a coredump.
+
+config OSCORE_CLOUD_DIAG_BREADCRUMB_SIZE
+	int "Retained breadcrumb snapshot size (bytes)"
+	default 256
+	depends on OSCORE_CLOUD_DIAG_BREADCRUMBS
+	help
+	  Bytes of the log ring's tail copied into retained RAM by the fatal
+	  handler. They ride the minimal inline crash report (key 22 "bc"), which
+	  must stay small for NTN, so there is no point keeping more than
+	  CLOUD_TELEMETRY_MAX_BREADCRUMB here. The full log comes from the
+	  coredump.
 
 config OSCORE_CLOUD_DIAG_BUILD_ID
 	bool "Embed a GNU build-id and report it as the firmware version"
@@ -297,19 +310,74 @@ config OSCORE_CLOUD_DIAG_DEVICE_INFO
 	  Report board name, modem firmware version, IMEI and SIM ICCID one-shot
 	  after boot. The server folds these onto the device record.
 
+choice OSCORE_CLOUD_DIAG_COREDUMP_STORAGE
+	prompt "Coredump storage backend"
+	default OSCORE_CLOUD_DIAG_COREDUMP_BACKEND_NONE
+	help
+	  Where the fatal handler stores a full Zephyr coredump. NONE leaves the
+	  choice to Zephyr's own DEBUG_COREDUMP_BACKEND_* (e.g. in-memory). The
+	  NVMC and SPI_NOR backends provide coredump_backend_other, so the
+	  application must select CONFIG_DEBUG_COREDUMP_BACKEND_OTHER=y.
+
+config OSCORE_CLOUD_DIAG_COREDUMP_BACKEND_NONE
+	bool "Zephyr built-in backend"
+
 config OSCORE_CLOUD_DIAG_COREDUMP_BACKEND_NVMC
-	bool "Fault-safe nrfx_nvmc flash coredump backend"
+	bool "Internal flash (nrfx_nvmc)"
 	depends on OSCORE_CLOUD_DIAG_CRASH
 	depends on DEBUG_COREDUMP_BACKEND_OTHER
 	help
 	  Store full coredumps in an internal-flash partition via nrfx_nvmc (safe
 	  from the fatal handler on nRF91 non-secure, where the stock flash backend
-	  deadlocks). Provides the out-of-tree coredump_backend_other, so the
-	  application must select the "other" backend
-	  (CONFIG_DEBUG_COREDUMP_BACKEND_OTHER=y). Requires a `coredump_partition`
-	  DT nodelabel attributed non-secure. Leave disabled to use Zephyr's
-	  in-memory coredump backend (survives a warm reset only), which needs no
-	  devicetree overlay.
+	  deadlocks). Requires a `coredump_partition` DT nodelabel in internal
+	  flash, attributed non-secure. Capacity is limited by internal flash
+	  (typically 32 KiB, so only THREADS-scope dumps with short stack tops
+	  fit), and the whole partition is erased in the fault handler. Use it
+	  only on boards without external flash; prefer SPI_NOR.
+
+config OSCORE_CLOUD_DIAG_COREDUMP_BACKEND_SPI_NOR
+	bool "External SPI NOR flash (polled SPIM)"
+	depends on OSCORE_CLOUD_DIAG_CRASH
+	depends on DEBUG_COREDUMP_BACKEND_OTHER
+	depends on SPI_NOR && FLASH_MAP
+	depends on SOC_FAMILY_NORDIC_NRF
+	select CRC
+	help
+	  Store full coredumps in a `coredump_partition` on an external
+	  jedec,spi-nor device. The fault handler drives the SPIM registers
+	  directly (busy-polled, no RTOS primitives) so it is safe with IRQs
+	  locked; read-back and erase after the reboot use the normal spi_nor
+	  driver. The slot is pre-erased in the background after upload, so a
+	  capture is program-only. Running out of space truncates the dump
+	  instead of discarding it. The partition must be 64 KiB aligned and a
+	  multiple of 64 KiB; 1 MiB holds a full-RAM (LINKER_RAM) dump with room
+	  to spare. The SPIM instance, CS GPIO, clock and deep-power-down timing
+	  come from the partition's parent node, so any jedec,spi-nor part on an
+	  nRF SPIM works (verified: GD25WB256 on the nRF9151 DK, GD25LE255 on the
+	  Thingy:91 X).
+
+endchoice
+
+config OSCORE_CLOUD_DIAG_COREDUMP_COMPRESS
+	bool "Compress coredumps on upload"
+	default y
+	depends on OSCORE_CLOUD_DIAG_CRASH && DEBUG_COREDUMP
+	help
+	  Stream the stored coredump through a byte run-length encoder ("ZRL1")
+	  while uploading. RAM dumps are dominated by runs of 0x00 and 0xAA
+	  (unused stack fill), so the stream shrinks to between a half and a third
+	  (nRF9151 DK: 127 KB -> 42 KB; Thingy:91 X: 178 KB -> 87 KB). Uploads go
+	  to the resumable POST /c/o + /c/d routes. A server without them (4.04
+	  on /c/o) gets the legacy raw POST /c upload instead.
+
+config OSCORE_CLOUD_DIAG_COREDUMP_KEEP_FIRST
+	bool "Keep the first un-uploaded coredump in a crash loop"
+	default y
+	depends on OSCORE_CLOUD_DIAG_COREDUMP_BACKEND_SPI_NOR
+	help
+	  When a dump is already pending upload, later crashes do not overwrite
+	  it (they are counted as dropped instead). The first crash of a loop is
+	  usually the root cause. Disable to always keep the latest crash.
 
 config OSCORE_CLOUD_DIAG_AUTO_ATTACH
 	bool "Fold diagnostics into telemetry automatically"
@@ -348,6 +416,8 @@ config OSCORE_CLOUD_DIAG_LIVENESS
 	  their task watchdogs, but the device stops making progress with the cloud
 	  (wedged modem link, stuck retry loop, half-open socket, a peripheral that
 	  no longer comes up). The reboot is attributed as DIAG_RESET_WATCHDOG.
+	  With OSCORE_CLOUD_DIAG_WATCHDOG it raises a fatal error with reason
+	  DIAG_FATAL_WATCHDOG_LIVENESS first, so the stall leaves a coredump.
 
 	  Leave disabled on devices that legitimately report less often than the
 	  timeout (deep-sleep / NTN duty cycles), or the device will reboot-loop.
@@ -362,6 +432,63 @@ config OSCORE_CLOUD_DIAG_LIVENESS_TIMEOUT_SECONDS
 	  Reboot if no successful cloud contact occurs within this many seconds.
 	  Must be well above the telemetry reporting interval so a normally
 	  reporting device never trips it. Default is 2 hours.
+
+config OSCORE_CLOUD_DIAG_WATCHDOG
+	bool "Watchdogs end in a coredump (task + hardware pre-watchdog)"
+	depends on OSCORE_CLOUD_DIAG_CRASH && TASK_WDT && TASK_WDT_HW_FALLBACK
+	depends on CPU_CORTEX_M
+	select WATCHDOG
+	help
+	  Make every watchdog expiry go through the fatal/coredump path before
+	  the reset, so the dump holds every thread stack and the log ring:
+
+	  - Task level: diag_watchdog_trigger() (call it from a task_wdt
+	    callback) records the starved thread in oscore_diag_crash_meta and
+	    raises a fatal error with reason DIAG_FATAL_WATCHDOG_TASK. The cloud
+	    liveness watchdog uses the same path (DIAG_FATAL_WATCHDOG_LIVENESS).
+	  - The library calls task_wdt_init() at boot with the hardware WDT
+	    (devicetree alias watchdog0, else wdt0), so the HW fallback is really armed.
+	    With OSCORE_CLOUD_DIAG_PRE_WATCHDOG it passes a shim that also
+	    re-arms the pre-watchdog on every hardware feed.
+
+if OSCORE_CLOUD_DIAG_WATCHDOG
+
+config OSCORE_CLOUD_DIAG_PRE_WATCHDOG
+	bool "Hardware pre-watchdog (zero-latency RTC IRQ ahead of the HW WDT)"
+	default y
+	depends on SOC_FAMILY_NORDIC_NRF
+	depends on ARMV7_M_ARMV8_M_MAINLINE
+	select ZERO_LATENCY_IRQS
+	help
+	  A spare RTC (devicetree chosen "oscore,pre-watchdog-rtc", default
+	  rtc0) runs as a zero-latency interrupt, so it preempts irq_lock()
+	  sections and every normal ISR. It is re-armed on each hardware WDT
+	  feed and fires OSCORE_CLOUD_DIAG_PRE_WATCHDOG_MARGIN_MS before the
+	  HW WDT would reset. Its handler takes the interrupted context (the
+	  stacked exception frame: stuck PC/LR/xPSR, thread vs ISR from
+	  EXC_RETURN) and enters the coredump path with reason
+	  DIAG_FATAL_WATCHDOG_HW. The HW WDT stays armed as the final backstop
+	  and is fed while the dump is written.
+
+	  The HW WDT period is TASK_WDT_MIN_TIMEOUT + TASK_WDT_HW_FALLBACK_DELAY
+	  and task_wdt feeds it at least every TASK_WDT_MIN_TIMEOUT, so
+	  TASK_WDT_HW_FALLBACK_DELAY must be larger than the margin (with room
+	  for timer jitter), or the pre-watchdog fires in normal operation.
+
+	  The RTC keeps counting while a debugger halts the CPU (the HW WDT
+	  pauses), so a long halt trips the pre-watchdog.
+
+config OSCORE_CLOUD_DIAG_PRE_WATCHDOG_MARGIN_MS
+	int "Pre-watchdog lead time before the HW WDT reset (ms)"
+	default 2000
+	range 500 10000
+	depends on OSCORE_CLOUD_DIAG_PRE_WATCHDOG
+	help
+	  How long before the hardware WDT would reset the pre-watchdog fires.
+	  Must cover the coredump write (~0.4 s into a pre-erased slot, more if
+	  the slot is dirty; the HW WDT is also fed during the write).
+
+endif # OSCORE_CLOUD_DIAG_WATCHDOG
 
 module = OSCORE_CLOUD_DIAG
 module-str = OSCORE cloud diagnostics
