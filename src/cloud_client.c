@@ -14,6 +14,9 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/net/coap.h>
 #include <zephyr/net/socket.h>
+#if defined(CONFIG_OSCORE_CLOUD_RAI)
+#include <zephyr/net/socket_ncs.h>
+#endif
 
 #include <errno.h>
 #include <stdio.h>
@@ -110,6 +113,16 @@ void oscore_cloud_feed_wdt(void)
 	}
 }
 
+static void server_addr(struct sockaddr_in *server)
+{
+	memset(server, 0, sizeof(*server));
+	server->sin_family = AF_INET;
+	server->sin_port = htons(g_cfg.server_port);
+	zsock_inet_pton(AF_INET, g_cfg.server_ip, &server->sin_addr);
+}
+
+static void rai_reset(void);
+
 int cloud_client_init(void)
 {
 	int err;
@@ -144,6 +157,25 @@ int cloud_client_init(void)
 		return -errno;
 	}
 
+	/* Connect the UDP socket to the (fixed) server so every request is a plain
+	 * zsock_send(). connect() on a datagram socket only sets the default peer:
+	 * no packet is sent. It also makes the modem drop datagrams from any other
+	 * source, and it is required for SO_RAI = RAI_NO_DATA (explicit release
+	 * without sending), which cloud_client_rai_release() uses. */
+	struct sockaddr_in server;
+
+	server_addr(&server);
+	if (zsock_connect(g_sock, (struct sockaddr *)&server, sizeof(server)) < 0) {
+		err = -errno;
+		LOG_ERR("connect %s:%u: %d", g_cfg.server_ip, g_cfg.server_port, err);
+		(void)zsock_close(g_sock);
+		g_sock = -1;
+		return err;
+	}
+
+	/* A hint queued for the previous socket must not leak onto the new one. */
+	rai_reset();
+
 	return 0;
 }
 
@@ -153,14 +185,146 @@ void cloud_client_deinit(void)
 		(void)zsock_close(g_sock);
 		g_sock = -1;
 	}
+	rai_reset();
 }
 
-static void server_addr(struct sockaddr_in *server)
+/* ------------------------------------------------------------------------
+ * Release Assistance Indication (SO_RAI)
+ *
+ * The caller (the cloud module) knows whether more traffic follows a send, so
+ * it queues a one-shot hint with cloud_client_rai_next(); the next request send
+ * consumes it and the hint resets to CLOUD_RAI_NONE (no setsockopt at all).
+ * Block1/Block2 transfers apply RAI_ONGOING to every block request instead, so
+ * a multi-block transfer never releases mid-way; the library never releases at
+ * the end of a transfer, the caller decides (cloud_client_rai_release()).
+ *
+ * RAI is advisory: a setsockopt failure is logged once and never fails a send.
+ * Everything compiles to no-ops when CONFIG_OSCORE_CLOUD_RAI=n.
+ * ------------------------------------------------------------------------ */
+
+#if defined(CONFIG_OSCORE_CLOUD_RAI)
+static enum cloud_rai_hint g_rai_next = CLOUD_RAI_NONE;
+static bool g_rai_warned;
+
+static const char *rai_name(int so_rai)
 {
-	memset(server, 0, sizeof(*server));
-	server->sin_family = AF_INET;
-	server->sin_port = htons(g_cfg.server_port);
-	zsock_inet_pton(AF_INET, g_cfg.server_ip, &server->sin_addr);
+	switch (so_rai) {
+	case RAI_NO_DATA:
+		return "NO_DATA";
+	case RAI_LAST:
+		return "LAST";
+	case RAI_ONE_RESP:
+		return "ONE_RESP";
+	case RAI_ONGOING:
+		return "ONGOING";
+	default:
+		return "?";
+	}
+}
+
+static int rai_setsockopt(int so_rai)
+{
+	if (g_sock < 0) {
+		return -ENOTCONN;
+	}
+	if (zsock_setsockopt(g_sock, SOL_SOCKET, SO_RAI, &so_rai, sizeof(so_rai)) < 0) {
+		int err = -errno;
+
+		if (!g_rai_warned) {
+			LOG_WRN("setsockopt(SO_RAI, %s): %d (RAI hints ignored)",
+				rai_name(so_rai), err);
+			g_rai_warned = true;
+		}
+		return err;
+	}
+	LOG_DBG("SO_RAI %s", rai_name(so_rai));
+	return 0;
+}
+
+static int rai_hint_to_so(enum cloud_rai_hint hint)
+{
+	switch (hint) {
+	case CLOUD_RAI_LAST:
+		return RAI_LAST;
+	case CLOUD_RAI_ONE_RESP:
+		return RAI_ONE_RESP;
+	case CLOUD_RAI_ONGOING:
+		return RAI_ONGOING;
+	case CLOUD_RAI_NONE:
+	default:
+		return 0;
+	}
+}
+
+static void rai_reset(void)
+{
+	g_rai_next = CLOUD_RAI_NONE;
+}
+
+/* Consume the queued one-shot hint right before a request send. */
+static void apply_rai_hint(void)
+{
+	enum cloud_rai_hint hint = g_rai_next;
+
+	g_rai_next = CLOUD_RAI_NONE;
+	if (hint != CLOUD_RAI_NONE) {
+		(void)rai_setsockopt(rai_hint_to_so(hint));
+	}
+}
+
+/* Before each Block1/Block2 block request: keep the link up. A pending one-shot
+ * hint is dropped, since a bulk transfer always continues past this send. */
+static void apply_rai_ongoing(void)
+{
+	g_rai_next = CLOUD_RAI_NONE;
+	(void)rai_setsockopt(RAI_ONGOING);
+}
+
+void cloud_client_rai_next(enum cloud_rai_hint hint)
+{
+	g_rai_next = hint;
+}
+
+int cloud_client_rai_release(void)
+{
+	g_rai_next = CLOUD_RAI_NONE;
+	return rai_setsockopt(RAI_NO_DATA);
+}
+#else
+static void rai_reset(void)
+{
+}
+
+static void apply_rai_hint(void)
+{
+}
+
+static void apply_rai_ongoing(void)
+{
+}
+
+void cloud_client_rai_next(enum cloud_rai_hint hint)
+{
+	ARG_UNUSED(hint);
+}
+
+int cloud_client_rai_release(void)
+{
+	return 0;
+}
+#endif /* CONFIG_OSCORE_CLOUD_RAI */
+
+/* Send one protected request on the connected socket. */
+static int sock_send(const char *what, const char *path, uint32_t block_num, size_t len)
+{
+	ssize_t sent = zsock_send(g_sock, coap_buf, len, 0);
+
+	if (sent != (ssize_t)len) {
+		LOG_ERR("%s send %s blk %u: %zd (errno %d)", what, path, block_num, sent,
+			sent < 0 ? errno : 0);
+		return -EIO;
+	}
+	return 0;
 }
 
 static int append_uri_path(struct coap_packet *req, const char *path)
@@ -217,7 +381,7 @@ static void flush_rx(void)
 		if (pr <= 0 || !(pfd.revents & ZSOCK_POLLIN)) {
 			break;
 		}
-		if (zsock_recvfrom(g_sock, recv_buf, sizeof(recv_buf), 0, NULL, NULL) < 0) {
+		if (zsock_recv(g_sock, recv_buf, sizeof(recv_buf), 0) < 0) {
 			break;
 		}
 		count++;
@@ -230,17 +394,14 @@ static void flush_rx(void)
 static int oscore_recv_response(const char *path, struct coap_oscore_response *resp,
 				struct coap_packet *parsed)
 {
-	struct sockaddr_in from;
-	socklen_t fromlen = sizeof(from);
 	ssize_t received;
 	size_t recv_len;
 	struct coap_packet local;
 	int err;
 
-	received = zsock_recvfrom(g_sock, recv_buf, sizeof(recv_buf), 0,
-				  (struct sockaddr *)&from, &fromlen);
+	received = zsock_recv(g_sock, recv_buf, sizeof(recv_buf), 0);
 	if (received < 0) {
-		LOG_ERR("recvfrom %s: %d", path, -errno);
+		LOG_ERR("recv %s: %d", path, -errno);
 		return -errno;
 	}
 
@@ -272,12 +433,9 @@ static int coap_oscore_request(uint8_t method, uint8_t coap_type, const char *pa
 			       const uint8_t *payload, size_t payload_len,
 			       struct coap_oscore_response *resp)
 {
-	struct sockaddr_in server;
 	struct coap_packet request;
 	ssize_t len;
 	int err;
-
-	server_addr(&server);
 
 	err = coap_packet_init(&request, coap_buf, sizeof(coap_buf), COAP_VERSION_1,
 			       coap_type, 8, coap_next_token(), method, coap_next_id());
@@ -324,11 +482,10 @@ static int coap_oscore_request(uint8_t method, uint8_t coap_type, const char *pa
 
 	flush_rx();
 
-	ssize_t sent = zsock_sendto(g_sock, coap_buf, len, 0,
-				    (struct sockaddr *)&server, sizeof(server));
-	if (sent != len) {
-		LOG_ERR("sendto %s: %zd", path, sent);
-		return -EIO;
+	apply_rai_hint();
+	err = sock_send("request", path, 0, len);
+	if (err) {
+		return err;
 	}
 
 	/* NON requests have no response; do not block on recv. */
@@ -407,12 +564,10 @@ static int append_block2_option(struct coap_packet *req, uint32_t block_num, uin
  * response to a prior attempt simply fails verification and is retried). */
 static int block2_send_request(const char *path, uint32_t block_num, uint8_t szx)
 {
-	struct sockaddr_in server;
 	struct coap_packet request;
 	ssize_t len;
 	int err;
 
-	server_addr(&server);
 	err = coap_packet_init(&request, coap_buf, sizeof(coap_buf), COAP_VERSION_1,
 			       COAP_TYPE_CON, 8, coap_next_token(), COAP_METHOD_GET,
 			       coap_next_id());
@@ -437,13 +592,8 @@ static int block2_send_request(const char *path, uint32_t block_num, uint8_t szx
 
 	flush_rx();
 
-	ssize_t sent = zsock_sendto(g_sock, coap_buf, len, 0,
-				    (struct sockaddr *)&server, sizeof(server));
-	if (sent != len) {
-		LOG_ERR("block2 sendto %s blk %u: %zd", path, block_num, sent);
-		return -EIO;
-	}
-	return 0;
+	apply_rai_ongoing();
+	return sock_send("block2", path, block_num, len);
 }
 
 int cloud_client_oscore_block2_get(const char *path, uint8_t szx,
@@ -587,12 +737,10 @@ int cloud_client_oscore_block2_get(const char *path, uint8_t szx,
 static int block2_post_send_request(const char *path, uint32_t block_num, uint8_t szx,
 				    const uint8_t *body, size_t body_len)
 {
-	struct sockaddr_in server;
 	struct coap_packet request;
 	ssize_t len;
 	int err;
 
-	server_addr(&server);
 	err = coap_packet_init(&request, coap_buf, sizeof(coap_buf), COAP_VERSION_1,
 			       COAP_TYPE_CON, 8, coap_next_token(), COAP_METHOD_POST,
 			       coap_next_id());
@@ -633,13 +781,8 @@ static int block2_post_send_request(const char *path, uint32_t block_num, uint8_
 
 	flush_rx();
 
-	ssize_t sent = zsock_sendto(g_sock, coap_buf, len, 0,
-				    (struct sockaddr *)&server, sizeof(server));
-	if (sent != len) {
-		LOG_ERR("block2 post sendto %s blk %u: %zd", path, block_num, sent);
-		return -EIO;
-	}
-	return 0;
+	apply_rai_ongoing();
+	return sock_send("block2 post", path, block_num, len);
 }
 
 int cloud_client_oscore_block2_post(const char *path, const uint8_t *body, size_t body_len,
@@ -770,12 +913,10 @@ static int append_block1_option(struct coap_packet *req, uint32_t block_num, uin
 static int block1_send_request(const char *path, uint32_t block_num, uint8_t szx, bool more,
 			       const uint8_t *chunk, size_t chunk_len)
 {
-	struct sockaddr_in server;
 	struct coap_packet request;
 	ssize_t len;
 	int err;
 
-	server_addr(&server);
 	err = coap_packet_init(&request, coap_buf, sizeof(coap_buf), COAP_VERSION_1,
 			       COAP_TYPE_CON, 8, coap_next_token(), COAP_METHOD_POST,
 			       coap_next_id());
@@ -814,13 +955,9 @@ static int block1_send_request(const char *path, uint32_t block_num, uint8_t szx
 	}
 
 	flush_rx();
-	ssize_t sent = zsock_sendto(g_sock, coap_buf, len, 0,
-				    (struct sockaddr *)&server, sizeof(server));
-	if (sent != len) {
-		LOG_ERR("block1 sendto %s blk %u: %zd", path, block_num, sent);
-		return -EIO;
-	}
-	return 0;
+
+	apply_rai_ongoing();
+	return sock_send("block1", path, block_num, len);
 }
 
 int cloud_client_oscore_block1_post(const char *path, size_t total_len, uint8_t szx,

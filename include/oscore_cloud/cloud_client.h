@@ -352,6 +352,40 @@ int cloud_client_init(void);
  */
 void cloud_client_deinit(void);
 
+/* ------------------------------------------------------------------------
+ * Release Assistance Indication (RAI)
+ *
+ * Lets the caller tell the LTE modem when the device is done, so the network
+ * can release the RRC connection instead of waiting for its inactivity timer.
+ * Only the caller knows whether more traffic follows (FOTA, coredump, A-GNSS,
+ * a storage batch...), so the library never releases on its own. Block1/Block2
+ * transfers mark every block request RAI_ONGOING so they never release
+ * mid-transfer. Requires CONFIG_OSCORE_CLOUD_RAI (and CONFIG_LTE_RAI_REQ for
+ * the modem to act on it); otherwise these calls are no-ops.
+ * ------------------------------------------------------------------------ */
+
+enum cloud_rai_hint {
+	CLOUD_RAI_NONE,     /* no indication (default) */
+	CLOUD_RAI_LAST,     /* release after the next send (NON uplink) */
+	CLOUD_RAI_ONE_RESP, /* release after the next send + one response (CON) */
+	CLOUD_RAI_ONGOING,  /* keep the link up after the next send */
+};
+
+/**
+ * Queue a one-shot RAI hint for the next request send. The send consumes it
+ * and the hint resets to CLOUD_RAI_NONE. A Block1/Block2 transfer drops any
+ * pending hint (it always continues past its sends). Never fails a send.
+ */
+void cloud_client_rai_next(enum cloud_rai_hint hint);
+
+/**
+ * Ask the modem to release the link now, without sending (SO_RAI =
+ * RAI_NO_DATA on the connected socket). Call after the last exchange of a
+ * batch or bulk transfer. 0 on success or when RAI is disabled, negative errno
+ * if the socket option fails (harmless: the inactivity timer releases).
+ */
+int cloud_client_rai_release(void);
+
 /**
  * Send a confirmable telemetry check-in (POST /t) and read the queue-mode
  * response envelope into *dl (may be NULL to ignore it). 0 on success.

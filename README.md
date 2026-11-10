@@ -72,6 +72,45 @@ command. A self-contained app may instead hardcode raw keys via the
 `master_secret` / `master_salt` / `sender_id` / `recipient_id` fields of
 `struct oscore_cloud_config`.
 
+## Release Assistance Indication (`CONFIG_OSCORE_CLOUD_RAI`)
+
+RAI lets the device tell the network that it has nothing more to send, so the
+RRC connection is released right after an uplink instead of when the network
+inactivity timer runs out. It is on by default and needs
+`CONFIG_LTE_RAI_REQ=y` so the modem asks the network for RAI support
+(`AT%RAI`). Without that, or on a cell that offers no RAI, the hints do
+nothing.
+
+The library connects its UDP socket to the server, so `RAI_NO_DATA` works, and
+exposes two calls. It never decides on its own that the link is idle, because
+only the application knows whether a FOTA download, coredump upload or batch
+comes next:
+
+```c
+cloud_client_rai_next(CLOUD_RAI_LAST);     /* one-shot: applied to the next send, then reset */
+cloud_client_rai_next(CLOUD_RAI_ONE_RESP); /* release after the next send + one response */
+cloud_client_rai_release();                /* RAI_NO_DATA: release now */
+```
+
+Every Block1 and Block2 request is sent with `RAI_ONGOING`, so a multi-block
+transfer is never released halfway. A `setsockopt()` failure is logged once and
+never fails a send.
+
+Networks honour different signals, so send both:
+
+| RAT | Mechanism | Honoured | Ignored |
+| --- | --- | --- | --- |
+| LTE-M | AS-RAI | explicit `RAI_NO_DATA` after the exchange | `RAI_ONE_RESP` |
+| NB-IoT | CP-RAI | `RAI_LAST` / `RAI_ONE_RESP` on the uplink | `RAI_NO_DATA` (it has no uplink to ride on) |
+
+So a NON post uses `RAI_LAST`, and a CON post uses `RAI_ONE_RESP` followed by
+`cloud_client_rai_release()` once the response is handled. Measured on an
+nRF9151 DK (Telenor NO, 2026-11-10), the connected time per post drops from
+5.8 s to 2.7–3.0 s on LTE-M and from 10.4–10.9 s to 0.2–0.6 s on NB-IoT. The
+charge for a NON post above the sleep floor drops by about 19 % on LTE-M and
+71 % on NB-IoT. The Asset Tracker Template `cloud` module shows the full
+policy (`cloud_rai_*` in `att/app/src/modules/cloud/cloud.c`).
+
 ## Device observability (`CONFIG_OSCORE_CLOUD_DIAG`)
 
 An optional, Memfault-style fleet-observability layer that reports device-health
