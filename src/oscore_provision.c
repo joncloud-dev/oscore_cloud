@@ -18,7 +18,30 @@
 #include <string.h>
 
 #include <psa/crypto.h>
+#if defined(CONFIG_BUILD_WITH_TFM)
 #include <psa/protected_storage.h>
+#define material_get psa_ps_get
+#define material_set psa_ps_set
+#else
+/* No TF-M (e.g. nRF92: PSA is hosted by the IronSide SE secure domain, which
+ * offers Crypto + Internal Trusted Storage but no Protected Storage). Same
+ * call signatures, so the record moves to ITS unchanged. */
+/* psa_its_* are implemented by the IronSide PSA client (nrf_security
+ * ssf_secdom: TF-M's tfm_its_api.c serialized over IPC), but its header lives
+ * in TF-M's interface/include, which also carries a psa/crypto.h that must not
+ * shadow the one in use. Declare the two calls (PSA Storage API 1.0). */
+#ifndef PSA_STORAGE_FLAG_NONE
+typedef uint64_t psa_storage_uid_t;
+typedef uint32_t psa_storage_create_flags_t;
+#define PSA_STORAGE_FLAG_NONE 0u
+#endif
+psa_status_t psa_its_set(psa_storage_uid_t uid, size_t data_length,
+			 const void *p_data, psa_storage_create_flags_t create_flags);
+psa_status_t psa_its_get(psa_storage_uid_t uid, size_t data_offset,
+			 size_t data_size, void *p_data, size_t *p_data_length);
+#define material_get psa_its_get
+#define material_set psa_its_set
+#endif
 
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/barrier.h>
@@ -51,7 +74,7 @@ int oscore_provision_load(struct oscore_ps_material *out)
 		return -EINVAL;
 	}
 
-	status = psa_ps_get(OSCORE_PS_UID_MATERIAL, 0, sizeof(*out), out, &got);
+	status = material_get(OSCORE_PS_UID_MATERIAL, 0, sizeof(*out), out, &got);
 	if (status == PSA_ERROR_DOES_NOT_EXIST) {
 		return -ENOENT;
 	}
@@ -140,7 +163,7 @@ static int store_master_secret(const uint8_t *secret, size_t len)
 
 static int store_material(const struct oscore_ps_material *m)
 {
-	psa_status_t status = psa_ps_set(OSCORE_PS_UID_MATERIAL, sizeof(*m), m,
+	psa_status_t status = material_set(OSCORE_PS_UID_MATERIAL, sizeof(*m), m,
 					 PSA_STORAGE_FLAG_NONE);
 
 	if (status != PSA_SUCCESS) {
