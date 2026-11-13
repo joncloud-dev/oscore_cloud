@@ -19,6 +19,14 @@
 #include <errno.h>
 #include <nrf_modem_gnss.h>
 
+#if defined(CONFIG_OSCORE_CLOUD_AGNSS_GALILEO) && defined(CONFIG_SETTINGS)
+#include <zephyr/settings/settings.h>
+#endif
+#if defined(CONFIG_OSCORE_CLOUD_AGNSS_GALILEO) && defined(CONFIG_SHELL)
+#include <zephyr/shell/shell.h>
+#include <zephyr/sys/reboot.h>
+#endif
+
 #include <oscore_cloud/agnss_client.h>
 #include <oscore_cloud/cloud_client.h>
 #include <oscore_cloud/cbor.h>
@@ -32,15 +40,26 @@
 #define AGNSS_TYPE_SYSTEM_TIME (1U << 5)
 #define AGNSS_TYPE_LOCATION   (1U << 6)
 #define AGNSS_TYPE_INTEGRITY  (1U << 7)
+#define AGNSS_TYPE_GAL_EPHEMERIS (1U << 8)
+#define AGNSS_TYPE_GGTO       (1U << 9)
+#define AGNSS_TYPE_GAL_ALMANAC (1U << 10)
 
 #define AGNSS_MAX_SV 32
+#define AGNSS_MAX_GAL_SV 36
 
 LOG_MODULE_REGISTER(agnss_client, CONFIG_OSCORE_CLOUD_LOG_LEVEL);
 
 /* Block2 response accumulation buffer. A full GPS constellation is up to 32
  * ephemerides at ~180 B of CBOR each, which together with the clock/UTC/iono
- * elements reaches ~6 KiB (worst case ~7.4 KiB), so size for 8 KiB. */
+ * elements reaches ~6 KiB (worst case ~7.4 KiB), so size for 8 KiB. Galileo
+ * adds up to 36 more ephemerides (~150 B text-key, ~110 B compact), so an
+ * unpruned ("all") text-key response needs ~13 KiB. Pruned compact responses
+ * stay far below either (9 GPS + 9 GAL = 1.4 KiB). */
+#if defined(CONFIG_OSCORE_CLOUD_AGNSS_GALILEO)
+static uint8_t resp_buf[14336];
+#else
 static uint8_t resp_buf[8192];
+#endif
 static size_t resp_len;
 
 /* Block2 size shared with the FOTA and P-GPS downloads (see the Kconfig help). */
@@ -71,24 +90,180 @@ static uint32_t request_type_mask(const struct nrf_modem_gnss_agnss_data_frame *
 		mask |= AGNSS_TYPE_INTEGRITY;
 	}
 
-	/* Per-system ephemeris/almanac needs (GPS is system index 0). */
+	if (req->data_flags & NRF_MODEM_GNSS_AGNSS_GGTO_REQUEST) {
+		mask |= AGNSS_TYPE_GGTO;
+	}
+
+	/* Per-system ephemeris/almanac needs. GPS and QZSS share the GPS bits;
+	 * Galileo has its own (old servers ignore them). */
 	for (int i = 0; i < req->system_count; i++) {
+		bool gal = (req->system[i].system_id == NRF_MODEM_GNSS_SYSTEM_GAL);
+
 		if (req->system[i].sv_mask_ephe) {
-			mask |= AGNSS_TYPE_EPHEMERIS;
+			mask |= gal ? AGNSS_TYPE_GAL_EPHEMERIS : AGNSS_TYPE_EPHEMERIS;
 		}
 		if (req->system[i].sv_mask_alm) {
-			mask |= AGNSS_TYPE_ALMANAC;
+			mask |= gal ? AGNSS_TYPE_GAL_ALMANAC : AGNSS_TYPE_ALMANAC;
 		}
 	}
 
 	return mask;
 }
 
-/* Worst-case request: map header + t/w/e/n + a position hint (two float64) or a
- * serving cell (mcc/mnc/tac/ci/rp/ta). 128 B is comfortable. */
+/* Galileo ephemeris need of the frame (request key "ge"), 0 if none. */
+static uint64_t request_gal_ephe_mask(const struct nrf_modem_gnss_agnss_data_frame *req)
+{
+	for (int i = 0; i < req->system_count; i++) {
+		if (req->system[i].system_id == NRF_MODEM_GNSS_SYSTEM_GAL) {
+			return req->system[i].sv_mask_ephe;
+		}
+	}
+	return 0;
+}
+
+#if defined(CONFIG_OSCORE_CLOUD_AGNSS_GALILEO)
+/* Same margin the Location library uses for GPS (method_gnss.c
+ * AGNSS_EXPIRY_THRESHOLD): data expiring within 80 min counts as needed. */
+#define GAL_EXPIRY_THRESHOLD_MIN 80
+#define GAL_ALL_SV_MASK 0xFFFFFFFFFULL /* E1..E36 */
+
+/* Test switch (shell "agnss gal on|off", persisted in settings key
+ * "agnss/gal_off") to compare TTFF with and without Galileo assistance. */
+#define GAL_OFF_SETTINGS_KEY "agnss/gal_off"
+static bool gal_off;
+
+#if defined(CONFIG_SETTINGS)
+static int u8_load_cb(const char *key, size_t len, settings_read_cb read_cb, void *cb_arg,
+		      void *param)
+{
+	uint8_t v = 0;
+
+	ARG_UNUSED(key);
+	if (len == sizeof(v) && read_cb(cb_arg, &v, sizeof(v)) == sizeof(v)) {
+		*(uint8_t *)param = v;
+	}
+	return 0;
+}
+#endif
+
+static bool galileo_disabled(void)
+{
+#if defined(CONFIG_SETTINGS)
+	static bool loaded;
+
+	if (!loaded) {
+		uint8_t v = 0;
+
+		loaded = true;
+		(void)settings_load_subtree_direct(GAL_OFF_SETTINGS_KEY, u8_load_cb, &v);
+		gal_off = (v != 0);
+	}
+#endif
+	return gal_off;
+}
+
+/*
+ * GALILEO-LOCLIB-GAP: the NCS Location library (lib/location/method_gnss.c,
+ * nrf 9f9725b23b, 2026-11) builds the A-GNSS need from
+ * nrf_modem_gnss_agnss_expiry_get() itself, but only for GPS and QZSS
+ * (method_gnss_agnss_expiry_process()), and method_gnss_assistance_request()
+ * overwrites data_flags without NRF_MODEM_GNSS_AGNSS_GGTO_REQUEST. So on an
+ * nRF92 the frame we get never asks for Galileo. Nordic confirmed the library
+ * needs work there. Until it does, re-read the expiry here and add the
+ * Galileo ephemeris need and the GGTO flag ourselves.
+ *
+ * When the Location library starts emitting a NRF_MODEM_GNSS_SYSTEM_GAL entry
+ * or the GGTO flag, the LOG_WRN below fires: delete this function (and the
+ * pointer in att cloud_location.c).
+ */
+static void augment_galileo_need(struct nrf_modem_gnss_agnss_data_frame *frame)
+{
+	static bool loclib_warned;
+	struct nrf_modem_gnss_agnss_expiry expiry;
+	uint64_t gal_ephe = 0;
+	bool gal_seen = false;
+	bool gps_ephe = false;
+	int err;
+
+	bool loclib_has_gal = (frame->data_flags & NRF_MODEM_GNSS_AGNSS_GGTO_REQUEST) != 0;
+
+	if (galileo_disabled()) {
+		LOG_INF("A-GNSS: Galileo assistance disabled (agnss gal off)");
+		return;
+	}
+
+	for (int i = 0; i < frame->system_count; i++) {
+		if (frame->system[i].system_id == NRF_MODEM_GNSS_SYSTEM_GAL) {
+			loclib_has_gal = true;
+		}
+		if (frame->system[i].system_id == NRF_MODEM_GNSS_SYSTEM_GPS &&
+		    frame->system[i].sv_mask_ephe) {
+			gps_ephe = true;
+		}
+	}
+	if (loclib_has_gal) {
+		if (!loclib_warned) {
+			LOG_WRN("Location lib now requests Galileo itself; "
+				"remove augment_galileo_need() (GALILEO-LOCLIB-GAP)");
+			loclib_warned = true;
+		}
+		return;
+	}
+
+	err = nrf_modem_gnss_agnss_expiry_get(&expiry);
+	if (err) {
+		LOG_WRN("A-GNSS: expiry_get failed (%d), no Galileo need", err);
+		return;
+	}
+
+	for (int i = 0; i < expiry.sv_count; i++) {
+		if (expiry.sv[i].system_id != NRF_MODEM_GNSS_SYSTEM_GAL) {
+			continue;
+		}
+		gal_seen = true;
+		if (expiry.sv[i].sv_id >= 1 && expiry.sv[i].sv_id <= AGNSS_MAX_GAL_SV &&
+		    expiry.sv[i].ephe_expiry <= GAL_EXPIRY_THRESHOLD_MIN) {
+			gal_ephe |= 1ULL << (expiry.sv[i].sv_id - 1);
+		}
+	}
+	if (!gal_seen) {
+		LOG_DBG("A-GNSS: modem reports no Galileo SVs, not requesting Galileo");
+		return;
+	}
+
+	/* Like QZSS in the Location library: whenever GPS ephemerides are
+	 * fetched, fetch all Galileo ones too (the download is cheap after
+	 * server-side pruning). */
+	if (gps_ephe) {
+		gal_ephe = GAL_ALL_SV_MASK;
+	}
+	if (gal_ephe && frame->system_count < NRF_MODEM_GNSS_MAX_SYSTEMS) {
+		struct nrf_modem_gnss_agnss_system_data_need *sys =
+			&frame->system[frame->system_count++];
+
+		sys->system_id = NRF_MODEM_GNSS_SYSTEM_GAL;
+		sys->sv_mask_ephe = gal_ephe;
+		sys->sv_mask_alm = 0; /* Galileo almanacs are not served */
+	}
+	if (gal_ephe || expiry.ggto_expiry <= GAL_EXPIRY_THRESHOLD_MIN) {
+		frame->data_flags |= NRF_MODEM_GNSS_AGNSS_GGTO_REQUEST;
+	}
+	/* NeQuick is Galileo's ionosphere model; the Location library already
+	 * asks for it in its request-everything set, but be explicit. */
+	if (gal_ephe) {
+		frame->data_flags |= NRF_MODEM_GNSS_AGNSS_NEQUICK_REQUEST;
+	}
+	LOG_INF("A-GNSS: Galileo need ephe=0x%llx ggto_expiry=%u min (added to request)",
+		gal_ephe, expiry.ggto_expiry);
+}
+#endif /* CONFIG_OSCORE_CLOUD_AGNSS_GALILEO */
+
+/* Worst-case request: map header + t/w/e/n/all/ge + a position hint (two
+ * float64) or a serving cell (mcc/mnc/tac/ci/rp/ta): ~90 B. 128 B is
+ * comfortable. */
 #define AGNSS_REQ_BUF 128
 
-static size_t build_request(uint8_t *buf, size_t bufsz, uint32_t mask,
+static size_t build_request(uint8_t *buf, size_t bufsz, uint32_t mask, uint64_t gal_mask,
 			    const struct agnss_fetch_opts *o)
 {
 	size_t off = 0;
@@ -102,6 +277,9 @@ static size_t build_request(uint8_t *buf, size_t bufsz, uint32_t mask,
 		n++;
 	}
 	if (o->all) {
+		n++;
+	}
+	if (gal_mask) {
 		n++;
 	}
 	if (pos) {
@@ -134,6 +312,10 @@ static size_t build_request(uint8_t *buf, size_t bufsz, uint32_t mask,
 	if (o->all) {
 		off += cbor_write_tstr(buf + off, "all", 3);
 		off += cbor_write_bool(buf + off, true);
+	}
+	if (gal_mask) {
+		off += cbor_write_tstr(buf + off, "ge", 2);
+		off += cbor_write_uint(buf + off, gal_mask);
 	}
 	if (pos) {
 		off += cbor_write_tstr(buf + off, "lat", 3);
@@ -244,6 +426,14 @@ struct agnss_decoded {
 	struct nrf_modem_gnss_agnss_data_location loc;
 	struct nrf_modem_gnss_agnss_gps_data_ephemeris eph[AGNSS_MAX_SV];
 	size_t eph_count;
+#if defined(CONFIG_OSCORE_CLOUD_AGNSS_GALILEO)
+	bool have_neq;
+	bool have_ggto;
+	struct nrf_modem_gnss_agnss_data_nequick neq;
+	struct nrf_modem_gnss_agnss_data_ggto ggto;
+	struct nrf_modem_gnss_agnss_gal_data_ephemeris gal_eph[AGNSS_MAX_GAL_SV];
+	size_t gal_eph_count;
+#endif
 };
 
 /* Read a CBOR double (major 7, additional info 27 / 0xfb). The server always
@@ -841,6 +1031,187 @@ static int parse_ephemerides_compact(struct cbor_reader *r,
 	return 0;
 }
 
+#if defined(CONFIG_OSCORE_CLOUD_AGNSS_GALILEO)
+/* ---- Galileo elements (agnss-schema.md 1.2 neq/ggto/geph, 1.4 compact) ---- */
+
+/* Key tables in the FROZEN compact order (= modem struct field order). The
+ * text-key form carries the same fields by name, so both encodings decode
+ * into one int64 array and share a single struct fill. */
+static const char *const neq_keys[] = { "ai0", "ai1", "ai2", "sc", "sv" };
+static const char *const ggto_keys[] = { "a0", "a1", "t0g", "wn" };
+static const char *const geph_keys[] = {
+	"sv", "toc", "af2", "af1", "af0", "tgd", "sisa", "toe", "w", "dn", "m0", "odot",
+	"e", "idot", "sa", "i0", "om0", "crs", "cis", "cus", "crc", "cic", "cuc",
+};
+#define GEPH_FIELDS ARRAY_SIZE(geph_keys)
+
+/* Read one element as ints in table order: a fixed-length array (compact) or
+ * a text-key map (unknown keys skipped, missing keys left 0). */
+static int read_fields(struct cbor_reader *r, bool compact, const char *const *keys,
+		       size_t nkeys, int64_t *v)
+{
+	uint64_t n;
+	int err;
+
+	memset(v, 0, nkeys * sizeof(*v));
+	if (compact) {
+		return read_int_array(r, v, nkeys);
+	}
+	err = read_container(r, CBOR_MAJOR_MAP, &n);
+	if (err) {
+		return err;
+	}
+	for (uint64_t i = 0; i < n; i++) {
+		char key[8];
+		size_t k;
+
+		if ((err = read_key(r, key, sizeof(key)))) {
+			return err;
+		}
+		for (k = 0; k < nkeys && strcmp(key, keys[k]); k++) {
+		}
+		err = (k < nkeys) ? read_int(r, &v[k]) : cbor_skip(r);
+		if (err) {
+			return err;
+		}
+	}
+	return 0;
+}
+
+static int decode_nequick(struct cbor_reader *r, bool compact,
+			  struct nrf_modem_gnss_agnss_data_nequick *q)
+{
+	int64_t v[ARRAY_SIZE(neq_keys)];
+	int err = read_fields(r, compact, neq_keys, ARRAY_SIZE(neq_keys), v);
+
+	if (err) {
+		return err;
+	}
+	q->ai0 = (int16_t)v[0];
+	q->ai1 = (int16_t)v[1];
+	q->ai2 = (int16_t)v[2];
+	q->storm_cond = (uint8_t)v[3];
+	q->storm_valid = (uint8_t)v[4];
+	return 0;
+}
+
+static int decode_ggto(struct cbor_reader *r, bool compact,
+		       struct nrf_modem_gnss_agnss_data_ggto *g)
+{
+	int64_t v[ARRAY_SIZE(ggto_keys)];
+	int err = read_fields(r, compact, ggto_keys, ARRAY_SIZE(ggto_keys), v);
+
+	if (err) {
+		return err;
+	}
+	g->a0 = (int16_t)v[0];
+	g->a1 = (int16_t)v[1];
+	g->t0g = (uint16_t)v[2];
+	g->wn = (uint16_t)v[3];
+	return 0;
+}
+
+static int decode_gal_ephemerides(struct cbor_reader *r, bool compact,
+				  struct nrf_modem_gnss_agnss_gal_data_ephemeris *eph, size_t *count)
+{
+	uint64_t n;
+	int err = read_container(r, CBOR_MAJOR_ARRAY, &n);
+
+	if (err) {
+		return err;
+	}
+	*count = 0;
+	for (uint64_t i = 0; i < n; i++) {
+		int64_t v[GEPH_FIELDS];
+		struct nrf_modem_gnss_agnss_gal_data_ephemeris *e;
+
+		if ((err = read_fields(r, compact, geph_keys, GEPH_FIELDS, v))) {
+			return err;
+		}
+		if (*count >= AGNSS_MAX_GAL_SV) {
+			continue; /* keep consuming; cap reached */
+		}
+		e = &eph[(*count)++];
+		memset(e, 0, sizeof(*e));
+		e->sv_id = (uint8_t)v[0];
+		e->toc = (uint16_t)v[1];
+		e->af2 = (int8_t)v[2];
+		e->af1 = (int32_t)v[3];
+		e->af0 = (int32_t)v[4];
+		e->tgd = (int16_t)v[5];
+		e->sisa = (uint8_t)v[6];
+		e->toe = (uint16_t)v[7];
+		e->w = (int32_t)v[8];
+		e->delta_n = (int16_t)v[9];
+		e->m0 = (int32_t)v[10];
+		e->omega_dot = (int32_t)v[11];
+		e->e = (uint32_t)v[12];
+		e->idot = (int16_t)v[13];
+		e->sqrt_a = (uint32_t)v[14];
+		e->i0 = (int32_t)v[15];
+		e->omega0 = (int32_t)v[16];
+		e->crs = (int16_t)v[17];
+		e->cis = (int16_t)v[18];
+		e->cus = (int16_t)v[19];
+		e->crc = (int16_t)v[20];
+		e->cic = (int16_t)v[21];
+		e->cuc = (int16_t)v[22];
+	}
+	return 0;
+}
+
+/* Write the Galileo ionosphere and time offset. Optional refinements like
+ * UTC/iono: a rejection is logged and the apply continues. */
+static void write_galileo_aux(const struct agnss_decoded *d)
+{
+	int err;
+
+	if (d->have_neq) {
+		err = nrf_modem_gnss_agnss_write((void *)&d->neq, sizeof(d->neq),
+						 NRF_MODEM_GNSS_AGNSS_NEQUICK_IONOSPHERIC_CORRECTION);
+		if (err) {
+			LOG_WRN("A-GNSS: nequick write failed: %d (continuing)", err);
+		}
+	}
+	if (d->have_ggto) {
+		/* GGTO is the LPP time model (3GPP TS 36.355
+		 * GNSS-TimeModelElement): t0g (16 s LSB) and wn are a time tag in
+		 * Galileo System Time, so wn is the GST week (GPS week - 1024). With
+		 * the GPS week the modem tracks Galileo but drops every SV from the
+		 * fix. The server already sends it that way (agnss-schema.md ggto),
+		 * so the element is written unchanged. */
+		err = nrf_modem_gnss_agnss_write((void *)&d->ggto, sizeof(d->ggto),
+						 NRF_MODEM_GNSS_AGNSS_GGTO);
+		if (err) {
+			LOG_WRN("A-GNSS: ggto write failed: %d (continuing)", err);
+		} else {
+			LOG_DBG("A-GNSS: ggto a0=%d a1=%d t0g=%u wn=%u", d->ggto.a0, d->ggto.a1,
+				d->ggto.t0g, d->ggto.wn);
+		}
+	}
+}
+
+/* Galileo ephemerides are supplementary: a rejected SV is logged and skipped
+ * so it cannot cost the GPS ephemerides already written. */
+static void write_gal_ephemerides(const struct nrf_modem_gnss_agnss_gal_data_ephemeris *eph,
+				  size_t count)
+{
+	size_t ok = 0;
+
+	for (size_t i = 0; i < count; i++) {
+		int err = nrf_modem_gnss_agnss_write((void *)&eph[i], sizeof(eph[i]),
+						     NRF_MODEM_GNSS_AGNSS_GAL_EPHEMERIDES);
+		if (err) {
+			LOG_WRN("A-GNSS: Galileo E%02u ephemeris write failed: %d", eph[i].sv_id,
+				err);
+		} else {
+			ok++;
+		}
+	}
+	LOG_INF("A-GNSS: wrote %zu/%zu Galileo ephemerides", ok, count);
+}
+#endif /* CONFIG_OSCORE_CLOUD_AGNSS_GALILEO */
+
 static int decode_and_write(const uint8_t *buf, size_t len, uint8_t encoding)
 {
 	/* Decode the full map first, then write in modem-required order (clock
@@ -848,11 +1219,14 @@ static int decode_and_write(const uint8_t *buf, size_t len, uint8_t encoding)
 	struct cbor_reader r;
 	uint64_t entries;
 	int err;
-	struct agnss_decoded decoded = { 0 };
+	/* Static: with Galileo the decoded set is ~4.5 KiB, too much for the
+	 * caller's stack. Fetches are serialized (resp_buf is static too). */
+	static struct agnss_decoded decoded;
 	uint64_t gps_week = 0;
 	uint64_t tow_ms = 0;
 	bool compact = (encoding == 1);
 
+	memset(&decoded, 0, sizeof(decoded));
 	cbor_reader_init(&r, buf, len);
 	err = read_container(&r, CBOR_MAJOR_MAP, &entries);
 	if (err) {
@@ -885,6 +1259,17 @@ static int decode_and_write(const uint8_t *buf, size_t len, uint8_t encoding)
 		} else if (!strcmp(key, "eph")) {
 			err = compact ? parse_ephemerides_compact(&r, decoded.eph, &decoded.eph_count)
 				      : parse_ephemerides(&r, decoded.eph, &decoded.eph_count);
+#if defined(CONFIG_OSCORE_CLOUD_AGNSS_GALILEO)
+		} else if (!strcmp(key, "neq")) {
+			err = decode_nequick(&r, compact, &decoded.neq);
+			decoded.have_neq = (err == 0);
+		} else if (!strcmp(key, "ggto")) {
+			err = decode_ggto(&r, compact, &decoded.ggto);
+			decoded.have_ggto = (err == 0);
+		} else if (!strcmp(key, "geph")) {
+			err = decode_gal_ephemerides(&r, compact, decoded.gal_eph,
+						     &decoded.gal_eph_count);
+#endif
 		} else {
 			/* Any future element: skip. */
 			err = cbor_skip(&r);
@@ -930,6 +1315,9 @@ static int decode_and_write(const uint8_t *buf, size_t len, uint8_t encoding)
 	} else {
 		LOG_WRN("A-GNSS: response had no iono element");
 	}
+#if defined(CONFIG_OSCORE_CLOUD_AGNSS_GALILEO)
+	write_galileo_aux(&decoded);
+#endif
 	if (decoded.eph_count > 0) {
 		err = write_ephemerides(decoded.eph, decoded.eph_count);
 		if (err) {
@@ -937,6 +1325,11 @@ static int decode_and_write(const uint8_t *buf, size_t len, uint8_t encoding)
 		}
 		LOG_INF("A-GNSS: wrote %zu ephemerides", decoded.eph_count);
 	}
+#if defined(CONFIG_OSCORE_CLOUD_AGNSS_GALILEO)
+	if (decoded.gal_eph_count > 0) {
+		write_gal_ephemerides(decoded.gal_eph, decoded.gal_eph_count);
+	}
+#endif
 
 	return 0;
 }
@@ -951,10 +1344,15 @@ int agnss_client_fetch_ex(const struct nrf_modem_gnss_agnss_data_frame *req,
 	uint32_t mask;
 	int err;
 	struct agnss_fetch_opts o;
+	struct nrf_modem_gnss_agnss_data_frame frame;
 
 	if (!req) {
 		return -EINVAL;
 	}
+	frame = *req;
+#if defined(CONFIG_OSCORE_CLOUD_AGNSS_GALILEO)
+	augment_galileo_need(&frame);
+#endif
 
 	if (opts) {
 		o = *opts;
@@ -965,11 +1363,11 @@ int agnss_client_fetch_ex(const struct nrf_modem_gnss_agnss_data_frame *req,
 		o.encoding = IS_ENABLED(CONFIG_OSCORE_CLOUD_AGNSS_COMPACT) ? 1 : 0;
 	}
 
-	mask = request_type_mask(req);
+	mask = request_type_mask(&frame);
 	LOG_DBG("A-GNSS request: data_flags=0x%x type mask=0x%x w=%u n=%u e=%u",
-		req->data_flags, mask, o.window_s, o.max_sv, o.encoding);
+		frame.data_flags, mask, o.window_s, o.max_sv, o.encoding);
 
-	req_size = build_request(req_buf, sizeof(req_buf), mask, &o);
+	req_size = build_request(req_buf, sizeof(req_buf), mask, request_gal_ephe_mask(&frame), &o);
 	if (req_size == 0) {
 		return -ENOMEM;
 	}
@@ -1002,3 +1400,62 @@ int agnss_client_fetch(const struct nrf_modem_gnss_agnss_data_frame *req)
 {
 	return agnss_client_fetch_ex(req, NULL);
 }
+
+#if defined(CONFIG_OSCORE_CLOUD_AGNSS_GALILEO) && defined(CONFIG_SHELL)
+/* ---- test shell: Galileo on/off and forced cold start ------------------- */
+
+static int cmd_agnss_gal(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc < 2) {
+		(void)galileo_disabled();
+		shell_print(sh, "Galileo assistance: %s", gal_off ? "off" : "on");
+		return 0;
+	}
+	if (!strcmp(argv[1], "on")) {
+		gal_off = false;
+	} else if (!strcmp(argv[1], "off")) {
+		gal_off = true;
+	} else {
+		shell_error(sh, "usage: agnss gal [on|off]");
+		return -EINVAL;
+	}
+#if defined(CONFIG_SETTINGS)
+	uint8_t v = gal_off ? 1 : 0;
+	int err = settings_save_one(GAL_OFF_SETTINGS_KEY, &v, sizeof(v));
+
+	if (err) {
+		shell_warn(sh, "not persisted: settings_save_one %d", err);
+	}
+#endif
+	shell_print(sh, "Galileo assistance: %s", gal_off ? "off" : "on");
+	return 0;
+}
+
+static int cmd_agnss_cold(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	/* Everything the modem keeps between fixes: ephemerides, almanacs, iono,
+	 * last fix, time, UTC, TCXO offset, EKF. GNSS must be stopped (between
+	 * location searches). The reboot also resets the Location library's
+	 * 60 min A-GNSS request rate limit, so the next search fetches fresh
+	 * assistance. */
+	int err = nrf_modem_gnss_nv_data_delete(0x5FF);
+
+	if (err) {
+		shell_error(sh, "nv_data_delete failed: %d (GNSS running? retry between searches)",
+			    err);
+		return err;
+	}
+	shell_print(sh, "GNSS data deleted, rebooting for a cold start");
+	k_sleep(K_MSEC(200));
+	sys_reboot(SYS_REBOOT_COLD);
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sub_agnss,
+	SHELL_CMD_ARG(gal, NULL, "Galileo assistance [on|off] (persisted)", cmd_agnss_gal, 1, 1),
+	SHELL_CMD(cold, NULL, "Delete all GNSS data and reboot (cold start test)", cmd_agnss_cold),
+	SHELL_SUBCMD_SET_END);
+SHELL_CMD_REGISTER(agnss, &sub_agnss, "A-GNSS test commands", NULL);
+#endif /* CONFIG_OSCORE_CLOUD_AGNSS_GALILEO && CONFIG_SHELL */

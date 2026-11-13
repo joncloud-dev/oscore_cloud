@@ -114,6 +114,19 @@ config OSCORE_CLOUD_AGNSS_COMPACT
 	  1.4), which drops per-field CBOR keys (~178 B/SV -> ~78 B/SV). Disable to
 	  request the legacy text-key maps.
 
+config OSCORE_CLOUD_AGNSS_GALILEO
+	bool "Request and inject Galileo A-GNSS"
+	default y if SOC_SERIES_NRF92
+	help
+	  Ask the server for Galileo I/NAV ephemerides, NeQuick and the
+	  GPS-Galileo time offset (request bits 8/9 and NeQuick, agnss-schema.md
+	  1.3) and write them to the modem. The NCS Location library only builds
+	  GPS/QZSS needs, so the Galileo need is read from
+	  nrf_modem_gnss_agnss_expiry_get() at fetch time (see
+	  GALILEO-LOCLIB-GAP in agnss_client.c). Needs a Galileo-capable modem
+	  (nRF92) and a server with AGNSS_SOURCE=rtcm; other servers ignore the
+	  bits.
+
 endif # OSCORE_CLOUD_AGNSS
 
 config OSCORE_CLOUD_PGPS
