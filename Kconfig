@@ -38,6 +38,17 @@ config OSCORE_CLOUD_EDHOC
 	  run is stored as a pending context and becomes the device's context
 	  once the server confirms it (B4, docs/NTN-SECURITY-A6.md §4).
 
+config OSCORE_CLOUD_EDHOC_COMBINED
+	bool "Send message_3 inside the first OSCORE request (RFC 9668)"
+	depends on OSCORE_CLOUD_EDHOC
+	default y
+	help
+	  Skip the separate message_3 / message_4 exchange: message_3 rides on
+	  every request under the new (pending) context until a response
+	  verifies, which is also the key confirmation (NTN security B5,
+	  docs/NTN-SECURITY-A6.md §3 and §4 rule 2). Saves one round trip and
+	  about 47 B per run. Shell "edhoc combined on|off" switches at runtime.
+
 config OSCORE_CLOUD_EDHOC_AUTO_REKEY
 	bool "Answer a rekey with an EDHOC run on TN"
 	depends on OSCORE_CLOUD_EDHOC

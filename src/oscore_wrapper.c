@@ -59,6 +59,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/net/coap.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/sys/util.h>
 
@@ -97,6 +98,11 @@ LOG_MODULE_REGISTER(oscore_wrapper, LOG_LEVEL_INF);
 #define EDHOC_SLOT_KEY_ID(i) ((psa_key_id_t)(OSCORE_MASTER_SECRET_KEY_ID + 2U + (i)))
 #define EDHOC_SECRET_LEN     16
 #define EDHOC_SALT_LEN       8
+/* RFC 9668: message_3 (a CBOR bstr) of a pending context, sent with every
+ * request under it until one verifies. Method 3 with a 1 B kid is about 20 B. */
+#define EDHOC_M3_MAX         48
+#define COAP_OPTION_EDHOC    21
+#define COAP_CODE_BAD_REQUEST 0x80 /* 4.00 */
 
 enum lane_kind {
 	LANE_PSK,
@@ -139,6 +145,10 @@ struct lane {
 	uint8_t idc[ID_CONTEXT_MAX];
 	size_t idc_len;
 
+	/* EDHOC pending, combined flow: message_3 ("oscore/m<slot>"). */
+	uint8_t m3[EDHOC_M3_MAX];
+	uint8_t m3_len;
+
 	/* Runtime only. */
 	int64_t first_miss_ms;
 	bool cap_logged;
@@ -170,6 +180,13 @@ static uint8_t raw_master_secret[32];
 static atomic_t bump_forced; /* shell request, applied before the next request */
 static bool edhoc_inflight;  /* a rekey asked for an EDHOC run */
 static bool edhoc_failed;    /* that run failed: use an epoch instead */
+
+/* SSN persistence since boot (B5): SSNs offered by uoscore, record writes. */
+static struct {
+	uint32_t offered;
+	uint32_t written;
+	uint32_t failed;
+} ssn_stats;
 
 #if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
 static bool fault_drop_confirm;
@@ -270,10 +287,10 @@ static void apply_kid_context_policy(struct lane *l)
  *
  * PSK: one settings record "oscore/ep" (B1, layout unchanged):
  *
- *   ssn        next sender sequence number of the current epoch. uoscore
- *              persists it through nvm_write_ssn() before the number is used
- *              (on the client it writes on every request: the echo state never
- *              leaves ECHO_REBOOT), and adds K + F (20) to it at boot.
+ *   ssn        a sender sequence number of the current epoch at least as high
+ *              as any PIV used minus K. nvm_write_ssn() writes it every K (10)
+ *              SSNs, before the first PIV that needs it (B5), and uoscore adds
+ *              K + F (20) to it at boot.
  *   epoch      current epoch. A bump writes epoch+1 with ssn 0 *before* the new
  *              context is derived or used, so no (epoch, ssn) pair is reused.
  *   confirmed  newest epoch a verified response has proven.
@@ -350,6 +367,9 @@ static uint64_t legacy_ssn;
 static bool legacy_present;
 static struct slot_rec loaded_slot[EDHOC_SLOTS];
 static bool loaded_slot_present[EDHOC_SLOTS];
+static uint8_t loaded_m3[EDHOC_SLOTS][EDHOC_M3_MAX];
+static uint8_t loaded_m3_len[EDHOC_SLOTS];
+static bool loaded_m3_present[EDHOC_SLOTS];
 
 static int oscore_cfg_set(const char *name, size_t len, settings_read_cb read_cb, void *cb_arg)
 {
@@ -396,6 +416,18 @@ static int oscore_cfg_set(const char *name, size_t len, settings_read_cb read_cb
 				return 0;
 			}
 			loaded_slot_present[i] = true;
+			return 0;
+		}
+		key[0] = 'm';
+		if (settings_name_steq(name, key, &next) && !next) {
+			loaded_m3_present[i] = true;
+			if (len == 0 || len > EDHOC_M3_MAX ||
+			    read_cb(cb_arg, loaded_m3[i], len) != (ssize_t)len) {
+				LOG_ERR("EDHOC message_3 record %s unreadable (%zu B)", key, len);
+				loaded_m3_len[i] = 0;
+				return 0;
+			}
+			loaded_m3_len[i] = (uint8_t)len;
 			return 0;
 		}
 	}
@@ -472,6 +504,36 @@ static int slot_delete(const struct lane *l)
 	return err;
 }
 
+static void m3_key(uint8_t slot, char *key, size_t cap)
+{
+	snprintf(key, cap, OSCORE_CFG_SUBTREE "/m%u", slot);
+}
+
+static int m3_save(const struct lane *l)
+{
+	char key[16];
+	int err;
+
+	m3_key(l->slot, key, sizeof(key));
+	err = settings_save_one(key, l->m3, l->m3_len);
+	if (err) {
+		LOG_ERR("settings_save_one(%s) failed: %d", key, err);
+	}
+	return err;
+}
+
+static void m3_delete(uint8_t slot)
+{
+	char key[16];
+	int err;
+
+	m3_key(slot, key, sizeof(key));
+	err = settings_delete(key);
+	if (err) {
+		LOG_ERR("settings_delete(%s) failed: %d", key, err);
+	}
+}
+
 static int legacy_save(uint64_t v)
 {
 	int err = settings_save_one(OSCORE_CFG_PATH_SSN, &v, sizeof(v));
@@ -518,6 +580,17 @@ static int legacy_poison(void)
 	return 0;
 }
 
+static int m3_save(const struct lane *l)
+{
+	ARG_UNUSED(l);
+	return 0;
+}
+
+static void m3_delete(uint8_t slot)
+{
+	ARG_UNUSED(slot);
+}
+
 #endif /* OSCORE_NVM_SUPPORT */
 
 static int lane_save(const struct lane *l)
@@ -554,6 +627,10 @@ static void slot_erase(struct lane *l)
 {
 	lane_teardown(l);
 	(void)slot_delete(l);
+	if (l->m3_len > 0) {
+		m3_delete(l->slot);
+		l->m3_len = 0;
+	}
 	(void)psa_destroy_key(EDHOC_SLOT_KEY_ID(l->slot));
 	l->state = SLOT_EMPTY;
 	l->epoch = 0;
@@ -641,9 +718,24 @@ static bool nvm_key_matches(const struct lane *l, const struct nvm_key_t *k)
 	       (l->idc_len == 0 || memcmp(k->id_context.ptr, l->idc, l->idc_len) == 0);
 }
 
-/* uoscore hook: persist the next SSN of the lane being protected. Called from
- * coap2oscore() before the PIV it follows is put on the wire; a failure aborts
- * the protect. */
+#if !defined(OSCORE_NVM_HAS_APP_STORE_POLICY)
+/* An older uoscore offers only every K-th SSN once a context leaves
+ * ECHO_REBOOT. Client contexts never do, but the write rule below relies on
+ * seeing every SSN. */
+#warning "uoscore without OSCORE_NVM_APP_STORE_POLICY: update the fork"
+#endif
+
+/* uoscore hook (OSCORE_NVM_APP_STORE_POLICY): offered every new SSN of the
+ * lane being protected, from coap2oscore() before the PIV it follows is put
+ * on the wire. A failure aborts the protect.
+ *
+ * Write rule (B5): persist when ssn reaches the last persisted value + K.
+ * Every PIV in use is then below persisted + K, and boot resumes at
+ * persisted + K + F, so no PIV repeats. The first SSN after a boot or an
+ * epoch change is already persisted + K + F + 1 and is written at once. A
+ * failed write aborts this protect and is tried again on the next one, so
+ * the bound holds without spending F. The rule does not need SSNs to be
+ * aligned to K (uoscore's own cyclic rule does). */
 enum err nvm_write_ssn(const struct nvm_key_t *nvm_key, uint64_t ssn)
 {
 	struct lane *l = hook_lane;
@@ -652,14 +744,20 @@ enum err nvm_write_ssn(const struct nvm_key_t *nvm_key, uint64_t ssn)
 		LOG_ERR("nvm_write_ssn for a context that is not the current one");
 		return wrong_parameter;
 	}
-	if (lane_save_ssn(l, ssn)) {
-		return unexpected_result_from_ext_lib;
-	}
+	ssn_stats.offered++;
 
 	/* Pre-B1 rollback image: same cadence its own uoscore used. */
 	if (l->kind == LANE_PSK && l->epoch == 0 && (ssn % K_SSN_NVM_STORE_INTERVAL) == 0) {
 		(void)legacy_save(ssn);
 	}
+	if (ssn < l->ssn + K_SSN_NVM_STORE_INTERVAL) {
+		return ok;
+	}
+	if (lane_save_ssn(l, ssn)) {
+		ssn_stats.failed++;
+		return unexpected_result_from_ext_lib;
+	}
+	ssn_stats.written++;
 	LOG_DBG("Persisted OSCORE %s epoch %" PRIu32 " SSN %" PRIu64, l->name, l->epoch, ssn);
 	return ok;
 }
@@ -915,6 +1013,11 @@ static void confirm_pending(void)
 	l->first_miss_ms = 0;
 	apply_kid_context_policy(l);
 	(void)slot_save(l);
+	if (l->m3_len > 0) {
+		/* Combined flow done: the server has the context. */
+		m3_delete(l->slot);
+		l->m3_len = 0;
+	}
 
 	if (!psk_parked) {
 		psk_parked = true;
@@ -936,6 +1039,27 @@ static void confirm_pending(void)
 	print_id(kid, sizeof(kid), l->sid, l->sid_len);
 	LOG_INF("OSCORE EDHOC context %s (kid %s, run %" PRIu32 ") confirmed; %s retired",
 		l->name, kid, l->seq, old->name);
+}
+
+/* An unprotected 4.00 (an EDHOC error) answered a combined request: the
+ * server holds no session for this message_3 any more. It expired, or the
+ * device's address changed since message_1 (a carrier NAT rebinds an idle
+ * UDP flow within about a minute), and the server ties a session to the
+ * address (A6 §3). Resending cannot succeed, so ask for a new run, which
+ * replaces the pending context (rule 6). The 4.00 is not authenticated: a
+ * spoofed one costs one EDHOC run on TN, nothing else, and the miss and
+ * fallback accounting of rule 3 runs as for any unanswered request. */
+static void combined_refused(struct lane *l)
+{
+	LOG_WRN("OSCORE pending %s: the server refused message_3 (no EDHOC session)", l->name);
+#if defined(CONFIG_OSCORE_CLOUD_EDHOC)
+	if (!edhoc_inflight && edhoc_rekey_possible()) {
+		LOG_WRN("EDHOC run on the next request to replace %s", l->name);
+		(void)oscore_edhoc_request_run(false);
+		edhoc_inflight = true;
+		pending_stale = 0;
+	}
+#endif
 }
 
 /* After a response verified under lane l. */
@@ -1253,6 +1377,20 @@ static int lanes_resolve(bool reprovisioned)
 	}
 	pending = pend;
 
+	/* message_3 belongs to a pending slot only (written before the slot
+	 * record, erased after confirmation); anything else is a torn leftover. */
+	for (int i = 0; i < EDHOC_SLOTS; i++) {
+		if (!loaded_m3_present[i]) {
+			continue;
+		}
+		if (&ed_lane[i] == pend && loaded_m3_len[i] > 0) {
+			memcpy(ed_lane[i].m3, loaded_m3[i], loaded_m3_len[i]);
+			ed_lane[i].m3_len = loaded_m3_len[i];
+		} else {
+			m3_delete((uint8_t)i);
+		}
+	}
+
 	if (active->kind == LANE_EDHOC) {
 		print_id(kid, sizeof(kid), active->sid, active->sid_len);
 		LOG_INF("OSCORE active: %s kid %s run %" PRIu32 " epoch %" PRIu32
@@ -1266,8 +1404,9 @@ static int lanes_resolve(bool reprovisioned)
 	}
 	if (pending != NULL) {
 		print_id(kid, sizeof(kid), pending->sid, pending->sid_len);
-		LOG_INF("OSCORE pending: %s kid %s run %" PRIu32 ", ssn %" PRIu64, pending->name,
-			kid, pending->seq, pending->ssn);
+		LOG_INF("OSCORE pending: %s kid %s run %" PRIu32 ", ssn %" PRIu64 "%s",
+			pending->name, kid, pending->seq, pending->ssn,
+			pending->m3_len ? ", combined" : "");
 	}
 	return 0;
 }
@@ -1287,6 +1426,7 @@ static int epoch_state_load(void)
 	loaded_rec_bad = false;
 	legacy_present = false;
 	memset(loaded_slot_present, 0, sizeof(loaded_slot_present));
+	memset(loaded_m3_present, 0, sizeof(loaded_m3_present));
 	err = settings_load_subtree(OSCORE_CFG_SUBTREE);
 	if (err) {
 		LOG_ERR("settings_load_subtree(%s) failed: %d", OSCORE_CFG_SUBTREE, err);
@@ -1436,6 +1576,119 @@ int oscore_wrapper_init_with_keys(const uint8_t *master_secret, size_t master_se
 	return 0;
 }
 
+/* ───────────────────── RFC 9668 combined request (B5) ─────────────────────── */
+
+static size_t opt_hdr_put(uint8_t *out, uint32_t delta, uint32_t len)
+{
+	uint8_t dn = delta < 13 ? (uint8_t)delta : (delta < 269 ? 13 : 14);
+	uint8_t ln = len < 13 ? (uint8_t)len : (len < 269 ? 13 : 14);
+	size_t n = 1;
+
+	out[0] = (uint8_t)((dn << 4) | ln);
+	if (dn == 13) {
+		out[n++] = (uint8_t)(delta - 13);
+	} else if (dn == 14) {
+		sys_put_be16((uint16_t)(delta - 269), &out[n]);
+		n += 2;
+	}
+	if (ln == 13) {
+		out[n++] = (uint8_t)(len - 13);
+	} else if (ln == 14) {
+		sys_put_be16((uint16_t)(len - 269), &out[n]);
+		n += 2;
+	}
+	return n;
+}
+
+static int opt_nibble(uint8_t nib, const uint8_t *p, size_t avail, size_t *used, uint32_t *v)
+{
+	if (nib < 13) {
+		*v = nib;
+	} else if (nib == 13 && avail >= *used + 1) {
+		*v = 13U + p[(*used)++];
+	} else if (nib == 14 && avail >= *used + 2) {
+		*v = 269U + sys_get_be16(&p[*used]);
+		*used += 2;
+	} else {
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/* Turn a protected request into an EDHOC + OSCORE request (RFC 9668 §3.2):
+ * add the empty EDHOC option and put message_3 in front of the ciphertext.
+ * The option is Class U and outside the AAD, so this works after protect.
+ * In place; the options after it get re-encoded deltas. */
+static int edhoc_combine(uint8_t *msg, size_t *msg_len, size_t cap, const uint8_t *m3,
+			 size_t m3_len)
+{
+	size_t len = *msg_len;
+	size_t pos;
+	size_t ins = 0;
+	size_t ins_hlen = 0;
+	uint32_t num = 0;
+	uint32_t prev = 0;
+	uint32_t next_num = 0;
+	uint32_t next_len = 0;
+	bool have_next = false;
+
+	if (len < 4 || len < 4U + (msg[0] & 0x0f)) {
+		return -EINVAL;
+	}
+	pos = 4U + (msg[0] & 0x0f);
+	while (pos < len && msg[pos] != 0xff) {
+		size_t h = 1;
+		uint32_t d;
+		uint32_t ol;
+
+		if (opt_nibble(msg[pos] >> 4, &msg[pos], len - pos, &h, &d) ||
+		    opt_nibble(msg[pos] & 0x0f, &msg[pos], len - pos, &h, &ol) ||
+		    pos + h + ol > len) {
+			return -EINVAL;
+		}
+		num += d;
+		if (num == COAP_OPTION_EDHOC) {
+			return -EALREADY;
+		}
+		if (num > COAP_OPTION_EDHOC && !have_next) {
+			have_next = true;
+			ins = pos;
+			ins_hlen = h;
+			next_num = num;
+			next_len = ol;
+		} else if (!have_next) {
+			prev = num;
+		}
+		pos += h + ol;
+	}
+	if (pos >= len) {
+		return -EINVAL; /* an OSCORE request always has a payload */
+	}
+
+	size_t marker = pos;
+	uint8_t hdr[8];
+	size_t hn = opt_hdr_put(hdr, COAP_OPTION_EDHOC - prev, 0);
+
+	if (have_next) {
+		hn += opt_hdr_put(&hdr[hn], next_num - COAP_OPTION_EDHOC, next_len);
+	} else {
+		ins = marker;
+	}
+	/* hn >= ins_hlen: the EDHOC option takes at least the byte a shorter
+	 * delta of the next option can save. */
+	size_t shift = hn - ins_hlen;
+
+	if (len + shift + m3_len > cap) {
+		return -ENOBUFS;
+	}
+	memmove(&msg[marker + 1 + shift + m3_len], &msg[marker + 1], len - marker - 1);
+	memmove(&msg[ins + hn], &msg[ins + ins_hlen], marker + 1 - (ins + ins_hlen));
+	memcpy(&msg[ins], hdr, hn);
+	memcpy(&msg[marker + 1 + shift], m3, m3_len);
+	*msg_len = len + shift + m3_len;
+	return 0;
+}
+
 int oscore_wrapper_protect(uint8_t *buf, size_t *len, size_t max_len)
 {
 	uint8_t protected_buf[OSCORE_MAX_PLAINTEXT_LEN + AUTH_TAG_LEN];
@@ -1469,18 +1722,29 @@ int oscore_wrapper_protect(uint8_t *buf, size_t *len, size_t max_len)
 		return oscore_status_to_errno(status);
 	}
 	if (k_uptime_get() - t0 > 500) {
-		/* SSN persistence (a settings write per request until B5) stalls. */
+		/* A settings write (SSN every K requests, or a record) stalled. */
 		LOG_WRN("OSCORE protect under %s took %lld ms", l->name, k_uptime_get() - t0);
 	}
 
-	if (protected_len > max_len) {
+	size_t out_len = protected_len;
+
+	if (l == pending && l->m3_len > 0) {
+		/* Rule 2: message_3 rides on every request until one verifies. */
+		err = edhoc_combine(protected_buf, &out_len, sizeof(protected_buf), l->m3,
+				    l->m3_len);
+		if (err) {
+			LOG_ERR("EDHOC + OSCORE request under %s: %d", l->name, err);
+			return err;
+		}
+	}
+	if (out_len > max_len) {
 		return -ENOBUFS;
 	}
 
 	tx_lane = l;
 	con_lane = is_con_request(buf, *len) ? l : NULL;
-	memcpy(buf, protected_buf, protected_len);
-	*len = protected_len;
+	memcpy(buf, protected_buf, out_len);
+	*len = out_len;
 
 	return 0;
 }
@@ -1523,6 +1787,10 @@ int oscore_wrapper_unprotect(uint8_t *buf, size_t *len, size_t max_len)
 	status = oscore2coap(buf, (uint32_t)*len, plaintext_buf, &plaintext_len, &l->ctx);
 	hook_lane = NULL;
 	if (status != ok) {
+		if (status == not_oscore_pkt && l == pending && l->m3_len > 0 && *len >= 2 &&
+		    buf[1] == COAP_CODE_BAD_REQUEST) {
+			combined_refused(l);
+		}
 		return oscore_status_to_errno(status);
 	}
 
@@ -1542,7 +1810,7 @@ int oscore_wrapper_unprotect(uint8_t *buf, size_t *len, size_t max_len)
 int oscore_wrapper_edhoc_install(const uint8_t *secret, size_t secret_len, const uint8_t *salt,
 				 size_t salt_len, const uint8_t *sender_id, size_t sender_id_len,
 				 const uint8_t *recipient_id, size_t recipient_id_len,
-				 const uint8_t fp[4])
+				 const uint8_t fp[4], const uint8_t *msg3, size_t msg3_len)
 {
 	psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
 	psa_key_id_t id;
@@ -1556,7 +1824,8 @@ int oscore_wrapper_edhoc_install(const uint8_t *secret, size_t secret_len, const
 		return -ENOTSUP;
 	}
 	if (secret_len != EDHOC_SECRET_LEN || salt_len > EDHOC_SALT_LEN || sender_id_len == 0 ||
-	    sender_id_len > LANE_ID_MAX || recipient_id_len > LANE_ID_MAX) {
+	    sender_id_len > LANE_ID_MAX || recipient_id_len > LANE_ID_MAX ||
+	    msg3_len > EDHOC_M3_MAX || (msg3_len > 0 && msg3 == NULL)) {
 		return -EINVAL;
 	}
 	if (psk_lane.sid_len == sender_id_len &&
@@ -1617,7 +1886,17 @@ int oscore_wrapper_edhoc_install(const uint8_t *secret, size_t secret_len, const
 	l->state = SLOT_PENDING;
 	l->rekey_requested = false;
 
-	/* Durable before the first request under it. */
+	/* Durable before the first request under it. message_3 goes first: a
+	 * leftover without its slot record is dropped at boot. */
+	if (msg3_len > 0) {
+		memcpy(l->m3, msg3, msg3_len);
+		l->m3_len = (uint8_t)msg3_len;
+		err = m3_save(l);
+		if (err) {
+			slot_erase(l);
+			return err;
+		}
+	}
 	err = slot_save(l);
 	if (err) {
 		slot_erase(l);
@@ -1636,7 +1915,8 @@ int oscore_wrapper_edhoc_install(const uint8_t *secret, size_t secret_len, const
 	edhoc_failed = false;
 	print_id(kid, sizeof(kid), l->sid, l->sid_len);
 	LOG_INF("OSCORE EDHOC context stored pending in %s (kid %s, run %" PRIu32
-		"); next CON goes under it", l->name, kid, l->seq);
+		"%s); next CON goes under it", l->name, kid, l->seq,
+		l->m3_len ? ", combined" : "");
 	return 0;
 }
 
@@ -1686,12 +1966,16 @@ int oscore_wrapper_epoch_status(struct oscore_epoch_status *out)
 	out->psk_epoch = psk_lane.epoch;
 	out->fallback = fallback;
 	out->edhoc_rekey_inflight = edhoc_inflight;
+	out->ssn_offered = ssn_stats.offered;
+	out->ssn_written = ssn_stats.written;
+	out->ssn_write_failed = ssn_stats.failed;
 	if (pending != NULL) {
 		out->pending = pending->name;
 		out->pending_run = pending->seq;
 		out->pending_ssn = pending->ready ? pending->ctx.sc.ssn : pending->ssn;
 		out->pending_kid_len = (uint8_t)pending->sid_len;
 		memcpy(out->pending_kid, pending->sid, pending->sid_len);
+		out->combined_m3_len = pending->m3_len;
 	}
 	return 0;
 }

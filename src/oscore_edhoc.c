@@ -5,7 +5,9 @@
  *
  * Profile (docs/NTN-SECURITY-A5.md §2): method 3, suite 2 (AES-CCM-16-64-128,
  * SHA-256, P-256), ID_CRED_x = { 4 : kid } sent compact, CRED_x = a CCS,
- * forward flow over CoAP (RFC 9528 App. A.2), message_4 always processed.
+ * forward flow over CoAP (RFC 9528 App. A.2). message_3 either goes inside
+ * the first OSCORE request under the new context (RFC 9668, B5, the default)
+ * or as its own POST answered by message_4.
  */
 
 #include <oscore_cloud/oscore_edhoc.h>
@@ -287,8 +289,17 @@ enum edhoc_fault {
 static enum edhoc_fault fault;
 #endif
 
+#if !defined(EDHOC_INITIATOR_NO_MESSAGE_4)
+#error "uoscore-uedhoc fork without edhoc_initiator_context.no_message_4"
+#endif
+
+static bool combined = IS_ENABLED(CONFIG_OSCORE_CLOUD_EDHOC_COMBINED);
+
 struct edhoc_transport {
 	const struct byte_array *c_r; /* filled by uedhoc before message_3 */
+	bool combined;                /* keep message_3 for the first request */
+	uint8_t m3[48];
+	size_t m3_len;
 	uint8_t tx_count;
 	uint8_t resp[256];
 	size_t resp_len;
@@ -338,6 +349,16 @@ static enum err edhoc_tx(void *sock, struct byte_array *data)
 		return unexpected_result_from_ext_lib;
 	}
 #endif
+	if (t->tx_count == 2 && t->combined) {
+		/* RFC 9668: message_3 goes with the first request under the new
+		 * context; there is no message_4. */
+		if (data->len > sizeof(t->m3)) {
+			return buffer_to_small;
+		}
+		memcpy(t->m3, data->ptr, data->len);
+		t->m3_len = data->len;
+		return ok;
+	}
 	t->resp_len = sizeof(t->resp);
 	err = cloud_client_edhoc_post(body, n, &code, t->resp, &t->resp_len);
 	if (err) {
@@ -419,7 +440,7 @@ static int edhoc_run(void)
 	struct byte_array prk_out = { .ptr = prk_out_buf, .len = sizeof(prk_out_buf) };
 	struct byte_array prk_exp = { .ptr = prk_exp_buf, .len = sizeof(prk_exp_buf) };
 	struct byte_array err_msg = { .ptr = err_buf, .len = sizeof(err_buf) };
-	struct edhoc_transport t = { .c_r = &c_r };
+	struct edhoc_transport t = { .c_r = &c_r, .combined = combined };
 	struct edhoc_initiator_context c = { 0 };
 	struct other_party_cred other = { 0 };
 	struct cred_array creds = { .len = 1, .ptr = &other };
@@ -467,6 +488,7 @@ static int edhoc_run(void)
 	c.g_i = (struct byte_array){ .ptr = g_i, .len = sizeof(g_i) };
 	c.i = (struct byte_array){ .ptr = (uint8_t *)&static_ref, .len = sizeof(static_ref) };
 	c.sock = &t;
+	c.no_message_4 = t.combined;
 
 	other.id_cred = (struct byte_array){ .ptr = id_cred_r,
 					     .len = (uint32_t)id_cred_build(&cred_r, id_cred_r) };
@@ -506,15 +528,16 @@ static int edhoc_run(void)
 
 	last.c_r_len = (uint8_t)MIN(c_r.len, sizeof(last.c_r));
 	memcpy(last.c_r, c_r.ptr, last.c_r_len);
-	LOG_INF("EDHOC done: message_4 verified, C_R %02x (%u B), OSCORE key fp %02x%02x%02x%02x, "
+	LOG_INF("EDHOC done: %s, C_R %02x (%u B), key fp %02x%02x%02x%02x, "
 		"%u B up / %u B down, %lld ms",
-		last.c_r[0], last.c_r_len, last.key_fp[0], last.key_fp[1], last.key_fp[2],
+		t.combined ? "message_3 kept (combined)" : "message_4 verified", last.c_r[0],
+		last.c_r_len, last.key_fp[0], last.key_fp[1], last.key_fp[2],
 		last.key_fp[3], t.bytes_up, t.bytes_down, k_uptime_get() - start);
 
 	/* RFC 9528 App. A.1: the initiator's OSCORE Sender ID is C_R, its
 	 * Recipient ID C_I. Stored pending; traffic moves once it is confirmed. */
 	err = oscore_wrapper_edhoc_install(secret, sizeof(secret), salt, sizeof(salt), c_r.ptr,
-					   c_r.len, &c_i_byte, 1, last.key_fp);
+					   c_r.len, &c_i_byte, 1, last.key_fp, t.m3, t.m3_len);
 	if (err) {
 		LOG_ERR("storing the EDHOC context failed: %d", err);
 	}
@@ -742,6 +765,22 @@ static int cmd_run(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int cmd_combined(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc > 1) {
+		if (strcmp(argv[1], "on") == 0) {
+			combined = true;
+		} else if (strcmp(argv[1], "off") == 0) {
+			combined = false;
+		} else {
+			shell_error(sh, "combined: on | off");
+			return -EINVAL;
+		}
+	}
+	shell_print(sh, "next run: %s", combined ? "combined (RFC 9668)" : "message_3/message_4");
+	return 0;
+}
+
 #if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
 static int cmd_fault(const struct shell *sh, size_t argc, char **argv)
 {
@@ -766,6 +805,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 		      0),
 	SHELL_CMD_ARG(server, NULL, "Pin CRED_R: <kid> <cred> (hex)", cmd_server, 3, 0),
 	SHELL_CMD_ARG(run, NULL, "Run EDHOC on the next cloud request: [force]", cmd_run, 1, 1),
+	SHELL_CMD_ARG(combined, NULL, "RFC 9668 combined request: [on|off]", cmd_combined, 1, 1),
 #if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
 	SHELL_CMD_ARG(fault, NULL, "Test: fault for the next run: none|msg2|msg3|msg4", cmd_fault,
 		      2, 0),

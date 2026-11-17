@@ -79,6 +79,10 @@ struct oscore_epoch_status {
 	uint64_t pending_ssn;
 	uint8_t pending_kid[8];
 	uint8_t pending_kid_len;
+	uint32_t ssn_offered;      /**< SSNs used since boot (all lanes) */
+	uint32_t ssn_written;      /**< of those, SSN record writes */
+	uint32_t ssn_write_failed; /**< failed SSN writes (protect aborted) */
+	uint8_t combined_m3_len;   /**< pending: message_3 sent with each request */
 };
 
 /** Read the context state. -ENOTSUP when the context has no epochs (raw keys,
@@ -91,18 +95,21 @@ int oscore_wrapper_epoch_status(struct oscore_epoch_status *out);
 int oscore_wrapper_epoch_request_bump(void);
 
 /**
- * Store the result of a completed EDHOC run (message_4 verified) as the
- * pending context (docs/NTN-SECURITY-A6.md §4 rule 1). The master secret is
+ * Store the result of a completed EDHOC run (message_4 verified, or message_2
+ * for the RFC 9668 combined flow) as the pending context
+ * (docs/NTN-SECURITY-A6.md §4 rule 1). The master secret is
  * imported as a persistent PSA key in a free A/B slot (or the slot of the
  * pending context it replaces, rule 6); the salt, the IDs and the epoch state
  * go to settings before the first request under it. sender_id is C_R,
- * recipient_id C_I. fp is a short fingerprint for logs. The caller wipes its
- * copy of the secret.
+ * recipient_id C_I. fp is a short fingerprint for logs. msg3 (combined flow)
+ * is message_3 as a CBOR bstr: it is stored with the context and sent with
+ * every request under it until one verifies (rule 2); NULL/0 for the
+ * message_4 flow. The caller wipes its copy of the secret.
  */
 int oscore_wrapper_edhoc_install(const uint8_t *secret, size_t secret_len, const uint8_t *salt,
 				 size_t salt_len, const uint8_t *sender_id, size_t sender_id_len,
 				 const uint8_t *recipient_id, size_t recipient_id_len,
-				 const uint8_t fp[4]);
+				 const uint8_t fp[4], const uint8_t *msg3, size_t msg3_len);
 
 /** A requested EDHOC run ended (0 = a context was installed, else why not).
  *  A rekey that asked for the run moves to a new epoch instead on failure. */

@@ -339,7 +339,13 @@ static int cmd_oscore_epoch(const struct shell *sh, size_t argc, char **argv)
 		shell_print(sh, "  pending %s kid %s run %u ssn %llu%s", st.pending, kid,
 			    st.pending_run, (unsigned long long)st.pending_ssn,
 			    st.fallback ? " (next CON under the active context)" : "");
+		if (st.combined_m3_len) {
+			shell_print(sh, "  combined: message_3 (%u B) rides on each request",
+				    st.combined_m3_len);
+		}
 	}
+	shell_print(sh, "  SSN writes %u of %u SSNs since boot (%u failed)", st.ssn_written,
+		    st.ssn_offered, st.ssn_write_failed);
 	return 0;
 }
 

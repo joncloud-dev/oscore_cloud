@@ -527,15 +527,17 @@ static void log_bearer(void)
 		p->max_retransmit);
 }
 
-/* CoAP tokens (A1 F2). OSCORE binds a response to its request through the
+/* CoAP tokens (A1 F2, B5). OSCORE binds a response to its request through the
  * request's kid and PIV, not the token, so the token only has to tell this
- * exchange's datagrams from stale ones. A 2-byte counter, seeded at random per
- * boot, cannot repeat within 65536 exchanges; flush_rx() and the token check
- * below drop anything older. Saves 6 B in every request and every response
- * against the 8 B random tokens used before. */
-#define COAP_TOKEN_LEN 2
+ * exchange's datagrams from stale ones. A 1-byte counter, seeded at random per
+ * boot, repeats only after 256 exchanges. Against a datagram that old,
+ * flush_rx() empties the socket before each send, a piggybacked response (ACK)
+ * must also carry this exchange's 16-bit message ID, and a separate response
+ * that still slipped through would fail OSCORE verification. Saves 7 B in
+ * every CON request and response against the 8 B random tokens used before. */
+#define COAP_TOKEN_LEN 1
 
-static uint16_t g_token_ctr;
+static uint8_t g_token_ctr;
 static uint8_t g_token[COAP_TOKEN_LEN];
 
 static const uint8_t *next_token(void)
@@ -543,11 +545,11 @@ static const uint8_t *next_token(void)
 	static bool seeded;
 
 	if (!seeded) {
-		g_token_ctr = (uint16_t)sys_rand32_get();
+		g_token_ctr = (uint8_t)sys_rand32_get();
 		seeded = true;
 	}
 	g_token_ctr++;
-	sys_put_be16(g_token_ctr, g_token);
+	g_token[0] = g_token_ctr;
 	return g_token;
 }
 
@@ -826,7 +828,8 @@ static int exchange_ex(const char *what, const char *path, uint32_t block_num, s
 			acked = true;
 			continue;
 		}
-		if (rtkl != tkl || received < 4 + rtkl || memcmp(&recv_buf[4], token, tkl) != 0) {
+		if (rtkl != tkl || received < 4 + rtkl || memcmp(&recv_buf[4], token, tkl) != 0 ||
+		    (rtype == COAP_TYPE_ACK && !mid_match)) {
 			g_xstats.stale++;
 			LOG_DBG("%s %s: dropped stale datagram (%zd B)", what, path, received);
 			continue;

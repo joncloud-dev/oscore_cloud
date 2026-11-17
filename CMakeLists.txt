@@ -13,6 +13,10 @@ if(CONFIG_OSCORE_CLOUD)
 # zephyr_interface. Requires the settings subsystem for the NVS-backed storage.
 if(CONFIG_UOSCORE AND CONFIG_SETTINGS)
   zephyr_compile_definitions(OSCORE_NVM_SUPPORT)
+  # B5: uoscore offers every new SSN to nvm_write_ssn(), and the wrapper
+  # writes one every K_SSN_NVM_STORE_INTERVAL SSNs (uoscore's client contexts
+  # would otherwise write on every request).
+  zephyr_compile_definitions(OSCORE_NVM_APP_STORE_POLICY)
 endif()
 
 # Raise uoscore's fixed message-staging buffers. OSCORE_MAX_PLAINTEXT_LEN sizes
@@ -28,13 +32,18 @@ if(CONFIG_UOSCORE)
 endif()
 
 # EDHOC (B3): process message_4 (the server always sends it; key
-# confirmation), compile out X.509 (CCS credentials only), and size uedhoc's fixed buffers for the A5 profile. CCS
-# credentials are about 100 B and ID_CRED_x is { 4 : kid } with a 1-4 B kid;
-# the 400 B defaults would cost several KB of cloud-thread stack.
+# confirmation) unless the run uses the RFC 9668 combined request (B5,
+# edhoc_initiator_context.no_message_4). Compile out X.509 and C509 (CCS
+# credentials only) and the signature paths of methods 0-2 (method 3 only,
+# B5), and size uedhoc's fixed buffers for the A5 profile. CCS credentials
+# are about 100 B and ID_CRED_x is { 4 : kid } with a 1-4 B kid; the 400 B
+# defaults would cost several KB of cloud-thread stack.
 if(CONFIG_OSCORE_CLOUD_EDHOC)
   zephyr_compile_definitions(
     MESSAGE_4
     EDHOC_NO_X509
+    EDHOC_NO_C509
+    EDHOC_STATIC_DH_ONLY
     CRED_I_SIZE=160
     CRED_R_SIZE=160
     ID_CRED_I_SIZE=16
