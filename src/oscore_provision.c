@@ -16,6 +16,7 @@
 #include <oscore_cloud/oscore_wrapper.h>
 
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <psa/crypto.h>
@@ -313,15 +314,63 @@ static int cmd_oscore_epoch(const struct shell *sh, size_t argc, char **argv)
 
 	err = oscore_wrapper_epoch_status(&st);
 	if (err) {
-		shell_error(sh, "No PSK epoch state (%d)", err);
+		shell_error(sh, "No epoch state (%d)", err);
 		return err;
 	}
-	shell_print(sh, "epoch %u confirmed %u ssn %llu misses %u%s%s%s", st.epoch, st.confirmed,
-		    (unsigned long long)st.ssn, st.misses, st.ready ? "" : " (no context)",
-		    st.kid_context_sent ? " kid-context" : "",
-		    st.rekey_requested ? " rekey-requested" : "");
+	char kid[17] = "";
+
+	for (uint8_t i = 0; i < st.kid_len && i < 8; i++) {
+		snprintf(&kid[2 * i], 3, "%02x", st.kid[i]);
+	}
+	shell_print(sh, "%s kid %s epoch %u confirmed %u ssn %llu misses %u%s%s%s%s", st.lane, kid,
+		    st.epoch, st.confirmed, (unsigned long long)st.ssn, st.misses,
+		    st.ready ? "" : " (no context)", st.kid_context_sent ? " kid-context" : "",
+		    st.rekey_requested ? " rekey-requested" : "",
+		    st.edhoc_rekey_inflight ? " edhoc-run-queued" : "");
+	if (st.edhoc) {
+		shell_print(sh, "  EDHOC run %u; PSK %s at epoch %u", st.run,
+			    st.psk_parked ? "parked" : "not parked", st.psk_epoch);
+	}
+	if (st.pending) {
+		kid[0] = '\0';
+		for (uint8_t i = 0; i < st.pending_kid_len && i < 8; i++) {
+			snprintf(&kid[2 * i], 3, "%02x", st.pending_kid[i]);
+		}
+		shell_print(sh, "  pending %s kid %s run %u ssn %llu%s", st.pending, kid,
+			    st.pending_run, (unsigned long long)st.pending_ssn,
+			    st.fallback ? " (next CON under the active context)" : "");
+	}
 	return 0;
 }
+
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+static int cmd_oscore_fault(const struct shell *sh, size_t argc, char **argv)
+{
+	int err = oscore_wrapper_test_fault(argv[1]);
+
+	if (err) {
+		shell_error(sh, "fault: none | confirm | reboot");
+	} else {
+		shell_print(sh, "fault %s armed for the pending context", argv[1]);
+	}
+	return err;
+}
+
+static int cmd_oscore_forget(const struct shell *sh, size_t argc, char **argv)
+{
+	int err;
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	err = oscore_wrapper_test_forget_edhoc();
+	if (err) {
+		shell_error(sh, "forget failed (%d)", err);
+	} else {
+		shell_print(sh, "EDHOC slots erased");
+	}
+	return err;
+}
+#endif
 
 static int cmd_oscore_epoch_bump(const struct shell *sh, size_t argc, char **argv)
 {
@@ -343,7 +392,7 @@ static int cmd_oscore_epoch_bump(const struct shell *sh, size_t argc, char **arg
 
 SHELL_STATIC_SUBCMD_SET_CREATE(
 	oscore_epoch_subcmds,
-	SHELL_CMD(bump, NULL, "Move to the next PSK epoch before the next request",
+	SHELL_CMD(bump, NULL, "Move the active context to its next epoch before the next request",
 		  cmd_oscore_epoch_bump),
 	SHELL_SUBCMD_SET_END);
 
@@ -356,7 +405,14 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD(verify, NULL,
 		  "Prove the provisioned master secret is non-exportable (opacity check)",
 		  cmd_oscore_verify),
-	SHELL_CMD(epoch, &oscore_epoch_subcmds, "Show the PSK epoch state", cmd_oscore_epoch),
+	SHELL_CMD(epoch, &oscore_epoch_subcmds, "Show the context and epoch state",
+		  cmd_oscore_epoch),
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+	SHELL_CMD_ARG(fault, NULL, "Test: none|confirm|reboot on the pending context",
+		      cmd_oscore_fault, 2, 0),
+	SHELL_CMD(forget, NULL, "Test: erase the EDHOC contexts (lost-context path)",
+		  cmd_oscore_forget),
+#endif
 	SHELL_SUBCMD_SET_END);
 
 SHELL_CMD_REGISTER(oscore, &oscore_subcmds, "OSCORE provisioning", NULL);

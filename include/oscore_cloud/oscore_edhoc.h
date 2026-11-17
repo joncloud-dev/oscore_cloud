@@ -21,9 +21,12 @@
  *   edhoc run [force]                   run EDHOC on the cloud thread (TN only
  *                                       unless forced)
  *
- * B3 stops at a verified message_4: the server then holds a pending EDHOC
- * context, and the derived OSCORE keys are reported by fingerprint and wiped.
- * Switching traffic to the new context is B4 (docs/NTN-SECURITY-A6.md §4).
+ * A run ends at a verified message_4: the server then holds a pending EDHOC
+ * context, and the derived OSCORE master secret and salt are handed to
+ * oscore_wrapper_edhoc_install(), which stores them as the device's pending
+ * context and moves traffic over once the server confirms it (B4,
+ * docs/NTN-SECURITY-A6.md §4). Runs start from the shell or, on TN, from a
+ * rekey request (CONFIG_OSCORE_CLOUD_EDHOC_AUTO_REKEY).
  */
 
 #ifndef OSCORE_EDHOC_H
@@ -40,6 +43,9 @@ void oscore_edhoc_service(void);
 
 /* Ask for a run on the next cloud request. force skips the TN-only check. */
 int oscore_edhoc_request_run(bool force);
+
+/* True when a run can start: static key and both credentials present. */
+bool oscore_edhoc_ready(void);
 
 /* Unprotected CON POST /.well-known/edhoc on the cloud socket, with the CoAP
  * retransmission of the cloud client. Implemented in cloud_client.c. */

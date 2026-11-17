@@ -34,8 +34,22 @@ config OSCORE_CLOUD_EDHOC
 	  static P-256 key is generated in PSA on the device (shell: edhoc
 	  keygen); credentials are provisioned from the shell. A run is started
 	  from the shell (edhoc run) and executes on the cloud thread on TN.
-	  Needs the uoscore-uedhoc fork with RFC 9528 kid handling. Traffic
-	  stays on the PSK context until B4 adds the transition.
+	  Needs the uoscore-uedhoc fork with RFC 9528 kid handling. A completed
+	  run is stored as a pending context and becomes the device's context
+	  once the server confirms it (B4, docs/NTN-SECURITY-A6.md §4).
+
+config OSCORE_CLOUD_EDHOC_AUTO_REKEY
+	bool "Answer a rekey with an EDHOC run on TN"
+	depends on OSCORE_CLOUD_EDHOC
+	default y
+	help
+	  When the server asks for a rekey (option 65000) or the sender
+	  sequence number reaches OSCORE_CLOUD_EPOCH_SSN_LIMIT, and the bearer
+	  is TN and EDHOC is provisioned, run EDHOC (fresh keys, forward
+	  secrecy) instead of moving to the next epoch. On NTN, without EDHOC
+	  credentials, or if the run fails, the device moves to the next epoch
+	  as before. A PSK device makes its first move to EDHOC this way, so an
+	  operator starts the transition by setting oscore_rekey_requested.
 
 config OSCORE_CLOUD_EPOCH_WINDOW
 	int "PSK epoch window W"

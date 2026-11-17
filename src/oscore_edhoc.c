@@ -10,6 +10,7 @@
 
 #include <oscore_cloud/oscore_edhoc.h>
 #include <oscore_cloud/oscore_provision.h>
+#include <oscore_cloud/oscore_wrapper.h>
 #include <oscore_cloud/cloud_client.h>
 
 #include <errno.h>
@@ -274,6 +275,18 @@ static int ecdh_key_generate(bool persistent, psa_key_id_t *id)
 
 /* ───────────────────────────── Transport ──────────────────────────────────── */
 
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+/* One-shot faults for the next run (A6 §5 fault matrix on hardware). */
+enum edhoc_fault {
+	FAULT_NONE,
+	FAULT_MSG2, /* message_1 sent, message_2 discarded */
+	FAULT_MSG3, /* message_3 never sent */
+	FAULT_MSG4, /* message_3 sent, message_4 discarded: the server holds a
+		     * pending context the device never stored */
+};
+static enum edhoc_fault fault;
+#endif
+
 struct edhoc_transport {
 	const struct byte_array *c_r; /* filled by uedhoc before message_3 */
 	uint8_t tx_count;
@@ -318,6 +331,13 @@ static enum err edhoc_tx(void *sock, struct byte_array *data)
 	n += data->len;
 	t->tx_count++;
 
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+	if (t->tx_count == 2 && fault == FAULT_MSG3) {
+		fault = FAULT_NONE;
+		LOG_WRN("fault: message_3 not sent");
+		return unexpected_result_from_ext_lib;
+	}
+#endif
 	t->resp_len = sizeof(t->resp);
 	err = cloud_client_edhoc_post(body, n, &code, t->resp, &t->resp_len);
 	if (err) {
@@ -326,6 +346,13 @@ static enum err edhoc_tx(void *sock, struct byte_array *data)
 	}
 	t->bytes_up += (uint32_t)n;
 	t->bytes_down += (uint32_t)t->resp_len;
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+	if ((t->tx_count == 1 && fault == FAULT_MSG2) || (t->tx_count == 2 && fault == FAULT_MSG4)) {
+		LOG_WRN("fault: message_%u discarded", t->tx_count == 1 ? 2 : 4);
+		fault = FAULT_NONE;
+		return unexpected_result_from_ext_lib;
+	}
+#endif
 	if (code != COAP_CODE_CHANGED) {
 		/* 4.00 / 5.00 / 5.03 carry an EDHOC error message: ERR_CODE, ERR_INFO. */
 		LOG_ERR("EDHOC message_%u refused: %u.%02u (%zu B error message)",
@@ -483,9 +510,14 @@ static int edhoc_run(void)
 		"%u B up / %u B down, %lld ms",
 		last.c_r[0], last.c_r_len, last.key_fp[0], last.key_fp[1], last.key_fp[2],
 		last.key_fp[3], t.bytes_up, t.bytes_down, k_uptime_get() - start);
-	/* B4 stores the context as pending and switches to it; until then the
-	 * keys are dropped and the PSK context stays in use. */
-	err = 0;
+
+	/* RFC 9528 App. A.1: the initiator's OSCORE Sender ID is C_R, its
+	 * Recipient ID C_I. Stored pending; traffic moves once it is confirmed. */
+	err = oscore_wrapper_edhoc_install(secret, sizeof(secret), salt, sizeof(salt), c_r.ptr,
+					   c_r.len, &c_i_byte, 1, last.key_fp);
+	if (err) {
+		LOG_ERR("storing the EDHOC context failed: %d", err);
+	}
 
 out:
 	(void)psa_destroy_key(eph_ref.id);
@@ -503,14 +535,24 @@ out:
 
 void oscore_edhoc_service(void)
 {
+	int err;
+
 	if (!atomic_cas(&run_requested, 1, 0)) {
 		return;
 	}
 	if (!atomic_cas(&run_forced, 1, 0) && cloud_client_transport() == CLOUD_TRANSPORT_NTN) {
 		LOG_WRN("EDHOC run skipped: bearer is NTN (edhoc run force overrides)");
-		return;
+		err = -ENETUNREACH;
+	} else {
+		err = edhoc_run();
 	}
-	(void)edhoc_run();
+	oscore_wrapper_edhoc_run_done(err);
+}
+
+bool oscore_edhoc_ready(void)
+{
+	return creds_load() == 0 && cred_i.cred_len != 0 && cred_r.cred_len != 0 &&
+	       static_key_present();
 }
 
 int oscore_edhoc_request_run(bool force)
@@ -602,6 +644,14 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 				    last.key_fp[3]);
 		}
 	}
+
+	struct oscore_epoch_status st;
+
+	if (oscore_wrapper_epoch_status(&st) == 0) {
+		shell_print(sh, "context: %s%s, pending: %s", st.lane,
+			    st.psk_parked ? " (PSK parked)" : "",
+			    st.pending ? st.pending : "none");
+	}
 	return 0;
 }
 
@@ -692,6 +742,23 @@ static int cmd_run(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+static int cmd_fault(const struct shell *sh, size_t argc, char **argv)
+{
+	static const char *const names[] = { "none", "msg2", "msg3", "msg4" };
+
+	for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+		if (strcmp(argv[1], names[i]) == 0) {
+			fault = (enum edhoc_fault)i;
+			shell_print(sh, "next run: fault %s", names[i]);
+			return 0;
+		}
+	}
+	shell_error(sh, "fault: none | msg2 | msg3 | msg4");
+	return -EINVAL;
+}
+#endif
+
 SHELL_STATIC_SUBCMD_SET_CREATE(
 	edhoc_cmds,
 	SHELL_CMD_ARG(keygen, NULL, "Create the static P-256 key: [replace]", cmd_keygen, 1, 1),
@@ -699,6 +766,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 		      0),
 	SHELL_CMD_ARG(server, NULL, "Pin CRED_R: <kid> <cred> (hex)", cmd_server, 3, 0),
 	SHELL_CMD_ARG(run, NULL, "Run EDHOC on the next cloud request: [force]", cmd_run, 1, 1),
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+	SHELL_CMD_ARG(fault, NULL, "Test: fault for the next run: none|msg2|msg3|msg4", cmd_fault,
+		      2, 0),
+#endif
 	SHELL_SUBCMD_SET_END);
 
 SHELL_CMD_REGISTER(edhoc, &edhoc_cmds, "EDHOC (method 3, suite 2) credentials and runs",

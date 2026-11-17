@@ -568,6 +568,8 @@ static struct {
 	uint32_t delay_ms;
 	uint32_t tx_dropped;
 	uint32_t rx_dropped;
+	uint32_t burst_skip; /* coap burst: let this many datagrams pass, */
+	uint32_t burst_drop; /* then drop this many */
 } g_impair;
 
 static bool impair_roll(uint8_t pct)
@@ -582,7 +584,15 @@ static bool impair_roll(uint8_t pct)
 static int xmit(const char *what, const char *path, uint32_t block_num, size_t len, bool first)
 {
 #if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
-	if (impair_roll(g_impair.tx_drop_pct)) {
+	bool burst = false;
+
+	if (g_impair.burst_skip > 0) {
+		g_impair.burst_skip--;
+	} else if (g_impair.burst_drop > 0) {
+		g_impair.burst_drop--;
+		burst = true;
+	}
+	if (burst || impair_roll(g_impair.tx_drop_pct)) {
 		g_impair.tx_dropped++;
 		LOG_WRN("impair: dropped %s %s blk %u (%zu B)", what, path, block_num, len);
 		return 0;
@@ -2272,6 +2282,15 @@ static int cmd_coap_impair(const struct shell *sh, size_t argc, char **argv)
 	g_impair.delay_ms = (uint32_t)strtoul(argv[3], NULL, 10);
 	return cmd_coap_show(sh, 1, argv);
 }
+
+static int cmd_coap_burst(const struct shell *sh, size_t argc, char **argv)
+{
+	g_impair.burst_skip = (uint32_t)strtoul(argv[1], NULL, 10);
+	g_impair.burst_drop = (uint32_t)strtoul(argv[2], NULL, 10);
+	shell_print(sh, "next %u datagram(s) pass, then %u are dropped", g_impair.burst_skip,
+		    g_impair.burst_drop);
+	return 0;
+}
 #endif
 
 SHELL_STATIC_SUBCMD_SET_CREATE(
@@ -2280,6 +2299,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 #if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
 	SHELL_CMD(impair, NULL, "Test impairment: <tx_drop_%> <rx_drop_%> <delay_ms>",
 		  cmd_coap_impair),
+	SHELL_CMD_ARG(burst, NULL, "Test: let <skip> datagrams pass, then drop <n>",
+		      cmd_coap_burst, 3, 0),
 #endif
 	SHELL_CMD(reset, NULL, "Reset the counters", cmd_coap_reset),
 	SHELL_SUBCMD_SET_END);
