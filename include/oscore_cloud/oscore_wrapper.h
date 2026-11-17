@@ -9,12 +9,20 @@
 #ifndef OSCORE_WRAPPER_H
 #define OSCORE_WRAPPER_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-/** One-time init of OSCORE context from PSA-provisioned material (opaque master
- *  secret key + Protected Storage salt/IDs). This is the default path. */
+/** Init the OSCORE context from PSA-provisioned material (opaque master secret
+ *  key + Protected Storage salt/IDs). This is the default path. It loads the
+ *  durable epoch record and derives the context of the current PSK epoch.
+ *  Idempotent while a context is live; after oscore_wrapper_deinit() it
+ *  derives the context again. */
 int oscore_wrapper_init(void);
+
+/** Tear down the live context and destroy its derived (volatile) PSA keys.
+ *  The durable epoch record and the provisioned key are left as they are. */
+void oscore_wrapper_deinit(void);
 
 /**
  * One-time init of OSCORE context from raw, caller-supplied key material,
@@ -27,15 +35,6 @@ int oscore_wrapper_init_with_keys(const uint8_t *master_secret, size_t master_se
 				  const uint8_t *sender_id, size_t sender_id_len,
 				  const uint8_t *recipient_id, size_t recipient_id_len);
 
-#if defined(CONFIG_OSCORE_USE_EDHOC)
-/** Run EDHOC with server, derive OSCORE context, then use protect/unprotect. */
-int edhoc_oscore_init(void);
-
-/** Return the UDP socket file descriptor from the EDHOC exchange.
- *  The OSCORE request must be sent from the same transport endpoint so the
- *  server can match the security context.  Returns -1 when unavailable. */
-int oscore_wrapper_get_socket(void);
-#endif
 
 /**
  * Protect (encrypt/sign) CoAP request in place. On entry, buf contains plain
@@ -48,5 +47,31 @@ int oscore_wrapper_protect(uint8_t *buf, size_t *len, size_t max_len);
  * OSCORE-protected CoAP; on success, buf contains plain CoAP and *len updated.
  */
 int oscore_wrapper_unprotect(uint8_t *buf, size_t *len, size_t max_len);
+
+/**
+ * Tell the wrapper that the request it last protected never reached the
+ * transmit path (send failed), so its missing response is not counted toward
+ * the epoch self-bump.
+ */
+void oscore_wrapper_request_not_sent(void);
+
+/** PSK epoch state (docs/NTN-SECURITY-A3.md). */
+struct oscore_epoch_status {
+	uint32_t epoch;        /**< current epoch (ID Context = base || epoch) */
+	uint32_t confirmed;    /**< newest epoch a verified response proved */
+	uint64_t ssn;          /**< next sender sequence number */
+	uint8_t misses;        /**< CON requests in a row without a verified response */
+	bool ready;            /**< a context is derived */
+	bool kid_context_sent; /**< requests carry the kid context */
+	bool rekey_requested;  /**< server asked for the next epoch */
+};
+
+/** Read the epoch state. -ENOTSUP when the context has no epochs (raw keys,
+ *  EDHOC, or no NVM support). */
+int oscore_wrapper_epoch_status(struct oscore_epoch_status *out);
+
+/** Ask for the next epoch before the next request (testing). -EALREADY when
+ *  the epoch is already confirmed + CONFIG_OSCORE_CLOUD_EPOCH_WINDOW. */
+int oscore_wrapper_epoch_request_bump(void);
 
 #endif /* OSCORE_WRAPPER_H */

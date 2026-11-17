@@ -31,6 +31,12 @@ enum cloud_transport {
 	CLOUD_TRANSPORT_NTN = 2, /* non-terrestrial (satellite) */
 };
 
+/* The bearer in use: NTN when the modem reports NTN NB-IoT (+CEREG AcT 14),
+ * TN otherwise, unless the shell forces one (coap bearer tn|ntn). It selects
+ * the CoAP transmission parameters, and the application reports it in
+ * telemetry key 1. */
+enum cloud_transport cloud_client_transport(void);
+
 /* ------------------------------------------------------------------------
  * Telemetry
  *

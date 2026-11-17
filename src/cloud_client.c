@@ -9,17 +9,29 @@
 #include <oscore_cloud/cbor.h>
 #include <oscore_cloud/oscore_wrapper.h>
 #include <oscore_cloud/cloud_config.h>
+#if defined(CONFIG_OSCORE_CLOUD_EDHOC)
+#include <oscore_cloud/oscore_edhoc.h>
+#endif
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/coap.h>
 #include <zephyr/net/socket.h>
+#include <zephyr/random/random.h>
+#include <zephyr/sys/byteorder.h>
+#if defined(CONFIG_LTE_LINK_CONTROL)
+#include <modem/lte_lc.h>
+#endif
+#if defined(CONFIG_SHELL)
+#include <zephyr/shell/shell.h>
+#endif
 #if defined(CONFIG_OSCORE_CLOUD_RAI)
 #include <zephyr/net/socket_ncs.h>
 #endif
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(cloud_client, LOG_LEVEL_INF);
@@ -57,14 +69,6 @@ LOG_MODULE_REGISTER(cloud_client, LOG_LEVEL_INF);
 static uint8_t coap_buf[COAP_BUF_SIZE];
 static uint8_t recv_buf[RECV_BUF_SIZE];
 static int g_sock = -1;
-
-/* Bound on how long a single (non-Block2) request waits for its response.
- * poll() is used instead of SO_RCVTIMEO, which the nRF91 offloaded socket
- * mishandles (see BLOCK2_RECV_TIMEOUT_MS note). Without this cap, a CON response
- * lost in marginal coverage blocks the cloud thread in recvfrom() indefinitely,
- * starving the task-watchdog feed and forcing a reboot loop. The timeout
- * comfortably exceeds the eDRX cycle (5.12 s). */
-#define REQUEST_RECV_TIMEOUT_MS 30000
 
 static struct cloud_shadow_delta g_inline_delta;
 
@@ -122,6 +126,7 @@ static void server_addr(struct sockaddr_in *server)
 }
 
 static void rai_reset(void);
+static void bearer_refresh(void);
 
 int cloud_client_init(void)
 {
@@ -175,6 +180,8 @@ int cloud_client_init(void)
 
 	/* A hint queued for the previous socket must not leak onto the new one. */
 	rai_reset();
+
+	bearer_refresh();
 
 	return 0;
 }
@@ -285,6 +292,11 @@ void cloud_client_rai_next(enum cloud_rai_hint hint)
 	g_rai_next = hint;
 }
 
+static inline enum cloud_rai_hint rai_peek(void)
+{
+	return g_rai_next;
+}
+
 int cloud_client_rai_release(void)
 {
 	g_rai_next = CLOUD_RAI_NONE;
@@ -308,6 +320,11 @@ void cloud_client_rai_next(enum cloud_rai_hint hint)
 	ARG_UNUSED(hint);
 }
 
+static inline enum cloud_rai_hint rai_peek(void)
+{
+	return CLOUD_RAI_NONE;
+}
+
 int cloud_client_rai_release(void)
 {
 	return 0;
@@ -322,6 +339,8 @@ static int sock_send(const char *what, const char *path, uint32_t block_num, siz
 	if (sent != (ssize_t)len) {
 		LOG_ERR("%s send %s blk %u: %zd (errno %d)", what, path, block_num, sent,
 			sent < 0 ? errno : 0);
+		/* Never reached the modem: its missing response is no epoch miss. */
+		oscore_wrapper_request_not_sent();
 		return -EIO;
 	}
 	return 0;
@@ -372,7 +391,7 @@ static void flush_rx(void)
 
 	/* poll(timeout=0) to test readability rather than MSG_DONTWAIT: the nRF91
 	 * offloaded socket mishandles non-blocking recv flags the same way it does
-	 * SO_RCVTIMEO (see BLOCK2_RECV_TIMEOUT_MS note). When poll reports data the
+	 * SO_RCVTIMEO (see wait_readable()). When poll reports data the
 	 * recvfrom returns immediately. */
 	while (count < 16) {
 		struct zsock_pollfd pfd = { .fd = g_sock, .events = ZSOCK_POLLIN };
@@ -391,25 +410,249 @@ static void flush_rx(void)
 	}
 }
 
-static int oscore_recv_response(const char *path, struct coap_oscore_response *resp,
-				struct coap_packet *parsed)
+/* ------------------------------------------------------------------------
+ * Bearer (TN / NTN) and CoAP transmission parameters (NTN security B2)
+ *
+ * The bearer comes from the modem's LTE mode (+CEREG AcT 14 = NTN NB-IoT) and
+ * selects one of two RFC 7252 transmission profiles. A shell override forces
+ * either profile, which is how the NTN timings are exercised without a
+ * satellite link.
+ * ------------------------------------------------------------------------ */
+
+enum bearer_override {
+	BEARER_AUTO = 0,
+	BEARER_FORCE_TN,
+	BEARER_FORCE_NTN,
+};
+
+static enum bearer_override g_bearer_override;
+static enum cloud_transport g_bearer_detected = CLOUD_TRANSPORT_TN;
+
+static void log_bearer(void);
+
+struct xmit_profile {
+	uint32_t ack_timeout_ms;
+	uint8_t max_retransmit;
+};
+
+static const struct xmit_profile xmit_tn = {
+	.ack_timeout_ms = CONFIG_OSCORE_CLOUD_COAP_ACK_TIMEOUT_MS,
+	.max_retransmit = CONFIG_OSCORE_CLOUD_COAP_MAX_RETRANSMIT,
+};
+
+static const struct xmit_profile xmit_ntn = {
+	.ack_timeout_ms = CONFIG_OSCORE_CLOUD_COAP_NTN_ACK_TIMEOUT_MS,
+	.max_retransmit = CONFIG_OSCORE_CLOUD_COAP_NTN_MAX_RETRANSMIT,
+};
+
+/* Counters for the shell and for the B2 measurements. */
+static struct {
+	uint32_t requests;     /* first transmissions (CON and NON) */
+	uint32_t retransmits;  /* identical-byte retransmissions */
+	uint32_t timeouts;     /* exchanges that ran out of retransmissions */
+	uint32_t stale;        /* datagrams dropped for a foreign token/MID */
+	uint32_t empty_acks;   /* separate-response ACKs seen */
+	uint32_t con_acked;    /* CON responses we acknowledged */
+	uint32_t last_rtt_ms;  /* first send to verified response */
+	uint32_t max_rtt_ms;
+} g_xstats;
+
+#if defined(CONFIG_LTE_LINK_CONTROL)
+static enum cloud_transport transport_from_lte_mode(enum lte_lc_lte_mode mode)
 {
-	ssize_t received;
-	size_t recv_len;
+	return mode == LTE_LC_LTE_MODE_NTN_NBIOT ? CLOUD_TRANSPORT_NTN : CLOUD_TRANSPORT_TN;
+}
+
+static void bearer_lte_handler(const struct lte_lc_evt *const evt)
+{
+	if (evt->type == LTE_LC_EVT_LTE_MODE_UPDATE) {
+		enum cloud_transport t = transport_from_lte_mode(evt->lte_mode);
+
+		if (t != g_bearer_detected) {
+			LOG_INF("bearer %s (LTE mode %d)", t == CLOUD_TRANSPORT_NTN ? "NTN" : "TN",
+				(int)evt->lte_mode);
+		}
+		g_bearer_detected = t;
+	}
+}
+
+/* Register for LTE mode updates once, and read the current mode: the cloud
+ * client is initialised after the network is up, so the attach-time update has
+ * usually already been delivered to the other handlers. */
+static void bearer_refresh(void)
+{
+	static bool registered;
+	enum lte_lc_lte_mode mode;
+
+	if (!registered) {
+		lte_lc_register_handler(bearer_lte_handler);
+		registered = true;
+	}
+	if (lte_lc_lte_mode_get(&mode) == 0) {
+		g_bearer_detected = transport_from_lte_mode(mode);
+	}
+	log_bearer();
+}
+#else
+static void bearer_refresh(void)
+{
+	log_bearer();
+}
+#endif
+
+enum cloud_transport cloud_client_transport(void)
+{
+	switch (g_bearer_override) {
+	case BEARER_FORCE_TN:
+		return CLOUD_TRANSPORT_TN;
+	case BEARER_FORCE_NTN:
+		return CLOUD_TRANSPORT_NTN;
+	default:
+		return g_bearer_detected;
+	}
+}
+
+static const struct xmit_profile *xmit_profile(void)
+{
+	return cloud_client_transport() == CLOUD_TRANSPORT_NTN ? &xmit_ntn : &xmit_tn;
+}
+
+static void log_bearer(void)
+{
+	const struct xmit_profile *p = xmit_profile();
+
+	LOG_INF("bearer %s%s: ACK timeout %u ms, %u retransmission(s)",
+		cloud_client_transport() == CLOUD_TRANSPORT_NTN ? "NTN" : "TN",
+		g_bearer_override == BEARER_AUTO ? "" : " (forced)", p->ack_timeout_ms,
+		p->max_retransmit);
+}
+
+/* CoAP tokens (A1 F2). OSCORE binds a response to its request through the
+ * request's kid and PIV, not the token, so the token only has to tell this
+ * exchange's datagrams from stale ones. A 2-byte counter, seeded at random per
+ * boot, cannot repeat within 65536 exchanges; flush_rx() and the token check
+ * below drop anything older. Saves 6 B in every request and every response
+ * against the 8 B random tokens used before. */
+#define COAP_TOKEN_LEN 2
+
+static uint16_t g_token_ctr;
+static uint8_t g_token[COAP_TOKEN_LEN];
+
+static const uint8_t *next_token(void)
+{
+	static bool seeded;
+
+	if (!seeded) {
+		g_token_ctr = (uint16_t)sys_rand32_get();
+		seeded = true;
+	}
+	g_token_ctr++;
+	sys_put_be16(g_token_ctr, g_token);
+	return g_token;
+}
+
+/* ------------------------------------------------------------------------
+ * Test-only link impairment (CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+ *
+ * Emulates a lossy, slow bearer on the device side so the retransmission and
+ * NTN timeouts can be tested on TN: a dropped TX is reported as sent but never
+ * reaches the modem (uplink loss), a dropped RX is read and discarded
+ * (downlink loss), and the delay hides every response until delay_ms after
+ * the request's first transmission (a minimum RTT) while the retransmission
+ * timer keeps running.
+ * ------------------------------------------------------------------------ */
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+static struct {
+	uint8_t tx_drop_pct;
+	uint8_t rx_drop_pct;
+	uint32_t delay_ms;
+	uint32_t tx_dropped;
+	uint32_t rx_dropped;
+} g_impair;
+
+static bool impair_roll(uint8_t pct)
+{
+	return pct > 0 && (sys_rand32_get() % 100U) < pct;
+}
+#endif
+
+/* Write one datagram from coap_buf. first marks the first transmission of a
+ * request: only then does a failed send mean the request never left (and is
+ * therefore no epoch miss). */
+static int xmit(const char *what, const char *path, uint32_t block_num, size_t len, bool first)
+{
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+	if (impair_roll(g_impair.tx_drop_pct)) {
+		g_impair.tx_dropped++;
+		LOG_WRN("impair: dropped %s %s blk %u (%zu B)", what, path, block_num, len);
+		return 0;
+	}
+#endif
+	if (first) {
+		return sock_send(what, path, block_num, len);
+	}
+
+	ssize_t sent = zsock_send(g_sock, coap_buf, len, 0);
+
+	if (sent != (ssize_t)len) {
+		LOG_ERR("%s retransmit %s blk %u: %zd (errno %d)", what, path, block_num, sent,
+			sent < 0 ? errno : 0);
+		return -EIO;
+	}
+	return 0;
+}
+
+/* Wait until the socket is readable or deadline (uptime ms) passes, feeding
+ * the watchdog: NTN waits run to minutes. Returns 1 readable, 0 timeout. */
+static int wait_readable(int64_t deadline)
+{
+	for (;;) {
+		int64_t left = deadline - k_uptime_get();
+
+		if (left <= 0) {
+			return 0;
+		}
+		oscore_cloud_feed_wdt();
+
+		struct zsock_pollfd pfd = { .fd = g_sock, .events = ZSOCK_POLLIN };
+		int pr = zsock_poll(&pfd, 1, (int)MIN(left, 5000));
+
+		if (pr < 0) {
+			return -errno;
+		}
+		if (pr > 0) {
+			if (!(pfd.revents & ZSOCK_POLLIN)) {
+				LOG_ERR("poll revents 0x%x", pfd.revents);
+				return -EIO;
+			}
+			return 1;
+		}
+	}
+}
+
+/* Acknowledge a CON response (a separate response) with an empty ACK. */
+static void send_empty_ack(uint16_t mid)
+{
+	uint8_t ack[4] = { 0x60, 0x00, (uint8_t)(mid >> 8), (uint8_t)mid };
+
+	(void)zsock_send(g_sock, ack, sizeof(ack), 0);
+	g_xstats.con_acked++;
+}
+
+/* Verify and parse the response sitting in recv_buf. */
+static int process_response(const char *path, size_t received, bool plain,
+			    struct coap_oscore_response *resp, struct coap_packet *parsed)
+{
+	size_t recv_len = received;
 	struct coap_packet local;
 	int err;
 
-	received = zsock_recv(g_sock, recv_buf, sizeof(recv_buf), 0);
-	if (received < 0) {
-		LOG_ERR("recv %s: %d", path, -errno);
-		return -errno;
-	}
-
-	recv_len = (size_t)received;
-	err = oscore_wrapper_unprotect(recv_buf, &recv_len, sizeof(recv_buf));
-	if (err) {
-		LOG_ERR("oscore unprotect %s (%u B wire): %d", path, (unsigned)received, err);
-		return err;
+	if (!plain) {
+		err = oscore_wrapper_unprotect(recv_buf, &recv_len, sizeof(recv_buf));
+		if (err) {
+			LOG_ERR("oscore unprotect %s (%zu B wire): %d", path, received, err);
+			return err;
+		}
 	}
 
 	if (!resp && !parsed) {
@@ -429,16 +672,188 @@ static int oscore_recv_response(const char *path, struct coap_oscore_response *r
 	return 0;
 }
 
+/* Send the protected request in coap_buf[0, len) and, for a CON, wait for its
+ * response, retransmitting the same bytes per RFC 7252 §4.2 (A1 F3): timeout
+ * ACK_TIMEOUT x [1, 1.5), doubled per retransmission, up to MAX_RETRANSMIT.
+ * A retransmission costs no SSN, and the server answers a copy of a request
+ * it already processed from its response cache (A4 F1) instead of running the
+ * handler again. A datagram with another token or message ID is a stale
+ * response to an earlier exchange and is dropped without touching OSCORE.
+ *
+ * Returns 0 with the verified response, -EAGAIN when every transmission timed
+ * out, *send_failed set (and -EIO) when the socket refused a datagram, or the
+ * OSCORE/CoAP error of the first matching response. plain skips OSCORE (the
+ * EDHOC messages, which are protected by EDHOC itself).
+ */
+static int exchange_ex(const char *what, const char *path, uint32_t block_num, size_t len,
+		       bool rai_ongoing, bool plain, struct coap_oscore_response *resp,
+		       struct coap_packet *parsed, bool *send_failed);
+
+static int exchange(const char *what, const char *path, uint32_t block_num, size_t len,
+		    bool rai_ongoing, struct coap_oscore_response *resp,
+		    struct coap_packet *parsed, bool *send_failed)
+{
+	return exchange_ex(what, path, block_num, len, rai_ongoing, false, resp, parsed,
+			   send_failed);
+}
+
+static int exchange_ex(const char *what, const char *path, uint32_t block_num, size_t len,
+		       bool rai_ongoing, bool plain, struct coap_oscore_response *resp,
+		       struct coap_packet *parsed, bool *send_failed)
+{
+	const struct xmit_profile *p = xmit_profile();
+	uint8_t type = (coap_buf[0] >> 4) & 0x03;
+	uint8_t tkl = coap_buf[0] & 0x0f;
+	uint16_t mid = sys_get_be16(&coap_buf[2]);
+	uint8_t token[COAP_TOKEN_LEN];
+	uint32_t timeout;
+	uint8_t tx = 0;
+	uint8_t max_rt;
+	bool acked = false;
+	int64_t start;
+	int64_t deadline;
+	int err;
+
+	*send_failed = false;
+	if (tkl != COAP_TOKEN_LEN || len < 4U + tkl) {
+		return -EINVAL;
+	}
+	memcpy(token, &coap_buf[4], tkl);
+
+	flush_rx();
+	if (rai_ongoing) {
+		apply_rai_ongoing();
+	} else {
+		apply_rai_hint();
+	}
+
+	start = k_uptime_get();
+	err = xmit(what, path, block_num, len, true);
+	if (err) {
+		*send_failed = true;
+		return err;
+	}
+	g_xstats.requests++;
+
+	/* NON requests have no response. */
+	if (type == COAP_TYPE_NON && !resp && !parsed) {
+		return 0;
+	}
+
+	max_rt = (type == COAP_TYPE_NON) ? 0 : p->max_retransmit;
+	timeout = p->ack_timeout_ms + (sys_rand32_get() % (p->ack_timeout_ms / 2U + 1U));
+	deadline = start + timeout;
+
+	for (;;) {
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+		/* Minimum RTT: no response is visible before delay_ms after the
+		 * first transmission; the retransmission timer keeps running. */
+		while (g_impair.delay_ms > 0 &&
+		       k_uptime_get() < MIN(start + g_impair.delay_ms, deadline)) {
+			oscore_cloud_feed_wdt();
+			k_msleep((int32_t)MIN(MIN(start + g_impair.delay_ms, deadline) -
+					      k_uptime_get(), 1000));
+		}
+#endif
+		int r = wait_readable(deadline);
+
+		if (r < 0) {
+			LOG_ERR("%s poll %s blk %u: %d", what, path, block_num, r);
+			return r;
+		}
+		if (r == 0) {
+			if (acked || tx >= max_rt) {
+				g_xstats.timeouts++;
+				LOG_WRN("%s %s blk %u: no response after %u transmission(s), %lld ms",
+					what, path, block_num, tx + 1U, k_uptime_get() - start);
+				return -EAGAIN;
+			}
+			tx++;
+			timeout *= 2U;
+			deadline = k_uptime_get() + timeout;
+			g_xstats.retransmits++;
+			LOG_WRN("%s %s blk %u: retransmit %u/%u (next wait %u ms)", what, path,
+				block_num, tx, max_rt, timeout);
+			err = xmit(what, path, block_num, len, false);
+			if (err) {
+				*send_failed = true;
+				return err;
+			}
+			continue;
+		}
+
+		ssize_t received = zsock_recv(g_sock, recv_buf, sizeof(recv_buf), 0);
+
+		if (received < 0) {
+			LOG_ERR("recv %s: %d", path, -errno);
+			return -errno;
+		}
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+		if (impair_roll(g_impair.rx_drop_pct)) {
+			g_impair.rx_dropped++;
+			LOG_WRN("impair: dropped response to %s %s blk %u", what, path, block_num);
+			continue;
+		}
+#endif
+		if (received < 4 || (recv_buf[0] >> 6) != 1) {
+			g_xstats.stale++;
+			continue;
+		}
+
+		uint8_t rtype = (recv_buf[0] >> 4) & 0x03;
+		uint8_t rtkl = recv_buf[0] & 0x0f;
+		uint16_t rmid = sys_get_be16(&recv_buf[2]);
+		bool mid_match = (rtype == COAP_TYPE_ACK || rtype == COAP_TYPE_RESET) && rmid == mid;
+
+		if (rtype == COAP_TYPE_RESET && mid_match) {
+			LOG_WRN("%s %s blk %u: reset by peer", what, path, block_num);
+			return -ECONNRESET;
+		}
+		if (recv_buf[1] == 0 && mid_match) {
+			/* Empty ACK: the response follows separately. Stop
+			 * retransmitting and wait out the rest of the span. */
+			g_xstats.empty_acks++;
+			acked = true;
+			continue;
+		}
+		if (rtkl != tkl || received < 4 + rtkl || memcmp(&recv_buf[4], token, tkl) != 0) {
+			g_xstats.stale++;
+			LOG_DBG("%s %s: dropped stale datagram (%zd B)", what, path, received);
+			continue;
+		}
+		if (rtype == COAP_TYPE_CON) {
+			send_empty_ack(rmid);
+		}
+
+		uint32_t rtt = (uint32_t)(k_uptime_get() - start);
+
+		g_xstats.last_rtt_ms = rtt;
+		g_xstats.max_rtt_ms = MAX(g_xstats.max_rtt_ms, rtt);
+		if (tx > 0) {
+			LOG_INF("%s %s blk %u: response after %u retransmission(s), %u ms", what,
+				path, block_num, tx, rtt);
+		}
+		return process_response(path, (size_t)received, plain, resp, parsed);
+	}
+}
+
 static int coap_oscore_request(uint8_t method, uint8_t coap_type, const char *path,
 			       const uint8_t *payload, size_t payload_len,
 			       struct coap_oscore_response *resp)
 {
 	struct coap_packet request;
 	ssize_t len;
+	bool send_failed;
 	int err;
 
+#if defined(CONFIG_OSCORE_CLOUD_EDHOC)
+	/* A shell-requested EDHOC run happens here, on the cloud thread, before
+	 * coap_buf is filled: the run reuses the socket and the buffers. */
+	oscore_edhoc_service();
+#endif
+
 	err = coap_packet_init(&request, coap_buf, sizeof(coap_buf), COAP_VERSION_1,
-			       coap_type, 8, coap_next_token(), method, coap_next_id());
+			       coap_type, COAP_TOKEN_LEN, next_token(), method, coap_next_id());
 	if (err) {
 		LOG_ERR("coap_packet_init %s: %d", path, err);
 		return err;
@@ -480,40 +895,70 @@ static int coap_oscore_request(uint8_t method, uint8_t coap_type, const char *pa
 		return err;
 	}
 
-	flush_rx();
+	/* On timeout the caller treats it as a network error and rebuilds the
+	 * connection. */
+	return exchange("request", path, 0, (size_t)len, false, resp, NULL, &send_failed);
+}
 
-	apply_rai_hint();
-	err = sock_send("request", path, 0, len);
+#if defined(CONFIG_OSCORE_CLOUD_EDHOC)
+int cloud_client_edhoc_post(const uint8_t *body, size_t body_len, uint8_t *code, uint8_t *out,
+			    size_t *out_len)
+{
+	struct coap_packet request;
+	struct coap_packet response;
+	struct coap_oscore_response resp;
+	bool send_failed;
+	int err;
+
+	if (g_sock < 0) {
+		return -ENOTCONN;
+	}
+	err = coap_packet_init(&request, coap_buf, sizeof(coap_buf), COAP_VERSION_1,
+			       COAP_TYPE_CON, COAP_TOKEN_LEN, next_token(), COAP_METHOD_POST,
+			       coap_next_id());
+	if (err) {
+		return err;
+	}
+	err = append_uri_path(&request, ".well-known/edhoc");
+	if (err) {
+		return err;
+	}
+	/* RFC 9528 Appendix A.2: the request carries C_x ahead of the message. */
+	err = coap_append_option_int(&request, COAP_OPTION_CONTENT_FORMAT, 65);
+	if (err) {
+		return err;
+	}
+	err = coap_packet_append_payload_marker(&request);
+	if (err) {
+		return err;
+	}
+	err = coap_packet_append_payload(&request, body, body_len);
 	if (err) {
 		return err;
 	}
 
-	/* NON requests have no response; do not block on recv. */
-	if (coap_type == COAP_TYPE_NON && !resp) {
-		return 0;
-	}
+	/* The run happens inside the application's next request: keep the link
+	 * up between message_1 and message_3, and leave the one-shot RAI hint the
+	 * application queued for that request untouched. */
+	enum cloud_rai_hint hint = rai_peek();
 
-	/* Cap the response wait so a lost datagram cannot hang the cloud thread
-	 * (and trip the watchdog). On timeout the caller treats it as a network
-	 * error and rebuilds the connection. */
-	struct zsock_pollfd pfd = { .fd = g_sock, .events = ZSOCK_POLLIN };
-	int pr = zsock_poll(&pfd, 1, REQUEST_RECV_TIMEOUT_MS);
-
-	if (pr == 0) {
-		LOG_WRN("recv timeout %s", path);
-		return -EAGAIN;
+	err = exchange_ex("edhoc", ".well-known/edhoc", 0, request.offset, true, true, &resp,
+			  &response, &send_failed);
+	cloud_client_rai_next(hint);
+	if (err) {
+		return err;
 	}
-	if (pr < 0) {
-		LOG_ERR("poll %s: %d", path, -errno);
-		return -errno;
+	*code = resp.code;
+	if (resp.payload_len > *out_len) {
+		return -ENOBUFS;
 	}
-	if (!(pfd.revents & ZSOCK_POLLIN)) {
-		LOG_ERR("poll %s: revents 0x%x", path, pfd.revents);
-		return -EIO;
+	if (resp.payload_len > 0) {
+		memcpy(out, resp.payload, resp.payload_len);
 	}
-
-	return oscore_recv_response(path, resp, NULL);
+	*out_len = resp.payload_len;
+	return 0;
 }
+#endif /* CONFIG_OSCORE_CLOUD_EDHOC */
 
 int cloud_client_oscore_get(const char *path, struct coap_oscore_response *resp)
 {
@@ -549,36 +994,70 @@ static int append_block2_option(struct coap_packet *req, uint32_t block_num, uin
 	return coap_packet_append_option(req, COAP_OPTION_BLOCK2, enc, elen);
 }
 
-/* Per-block receive budget and retransmit count. A long FOTA download (~800
- * CON request/response exchanges over LTE-M) will eventually hit a lost
- * datagram; without a bounded wait + retransmit the cloud thread blocks in
- * recvfrom forever, which also starves telemetry (same thread). zsock_poll()
- * is used instead of SO_RCVTIMEO because the latter is mishandled by the nRF91
- * offloaded socket. The timeout comfortably exceeds the eDRX cycle (5.12 s).
- */
-#define BLOCK2_RECV_TIMEOUT_MS 10000
-#define BLOCK2_MAX_RETRIES     5
+/* A block exchange that fails (every CoAP retransmission timed out, or the
+ * response did not verify) is retried as a new, freshly protected request up
+ * to this many times in all. The CoAP layer already retransmits identical
+ * bytes inside each attempt (exchange()), so this only covers a lost context
+ * sync or a long outage. */
+#define BLOCK_MAX_ATTEMPTS 3
 
-/* Build, OSCORE-protect, and send one Block2 GET request. Each call advances
- * the OSCORE sequence number, so a retransmit is a fresh request (a late
- * response to a prior attempt simply fails verification and is retried). */
-static int block2_send_request(const char *path, uint32_t block_num, uint8_t szx)
+/* Run one block exchange: build + protect (a new SSN per attempt) through
+ * build(), then exchange(). Returns 0 with the verified response, the send or
+ * build error, or the last attempt's error (-ETIMEDOUT for timeouts). */
+static int block_exchange(const char *what, const char *path, uint32_t block_num,
+			  int (*build)(const void *arg, size_t *len), const void *arg,
+			  struct coap_oscore_response *resp, struct coap_packet *parsed)
 {
+	int err = 0;
+
+	for (int attempt = 1; attempt <= BLOCK_MAX_ATTEMPTS; attempt++) {
+		size_t len;
+		bool send_failed;
+
+		err = build(arg, &len);
+		if (err) {
+			LOG_ERR("%s build %s blk %u: %d", what, path, block_num, err);
+			return err;
+		}
+		err = exchange(what, path, block_num, len, true, resp, parsed, &send_failed);
+		if (err == 0 || send_failed) {
+			return err;
+		}
+		if (attempt < BLOCK_MAX_ATTEMPTS) {
+			LOG_WRN("%s %s blk %u: attempt %d failed (%d), new request", what, path,
+				block_num, attempt, err);
+		}
+	}
+	LOG_ERR("%s %s blk %u: failed after %d attempts: %d", what, path, block_num,
+		BLOCK_MAX_ATTEMPTS, err);
+	return err == -EAGAIN ? -ETIMEDOUT : err;
+}
+
+struct block2_get_args {
+	const char *path;
+	uint32_t block_num;
+	uint8_t szx;
+};
+
+/* Build and OSCORE-protect one Block2 GET request into coap_buf. */
+static int block2_build_request(const void *arg, size_t *out_len)
+{
+	const struct block2_get_args *a = arg;
 	struct coap_packet request;
 	ssize_t len;
 	int err;
 
 	err = coap_packet_init(&request, coap_buf, sizeof(coap_buf), COAP_VERSION_1,
-			       COAP_TYPE_CON, 8, coap_next_token(), COAP_METHOD_GET,
+			       COAP_TYPE_CON, COAP_TOKEN_LEN, next_token(), COAP_METHOD_GET,
 			       coap_next_id());
 	if (err) {
 		return err;
 	}
-	err = append_uri_path(&request, path);
+	err = append_uri_path(&request, a->path);
 	if (err) {
 		return err;
 	}
-	err = append_block2_option(&request, block_num, szx);
+	err = append_block2_option(&request, a->block_num, a->szx);
 	if (err) {
 		return err;
 	}
@@ -586,14 +1065,11 @@ static int block2_send_request(const char *path, uint32_t block_num, uint8_t szx
 	len = request.offset;
 	err = oscore_wrapper_protect(coap_buf, (size_t *)&len, sizeof(coap_buf));
 	if (err) {
-		LOG_ERR("oscore protect block2 %s blk %u: %d", path, block_num, err);
+		LOG_ERR("oscore protect block2 %s blk %u: %d", a->path, a->block_num, err);
 		return err;
 	}
-
-	flush_rx();
-
-	apply_rai_ongoing();
-	return sock_send("block2", path, block_num, len);
+	*out_len = (size_t)len;
+	return 0;
 }
 
 int cloud_client_oscore_block2_get(const char *path, uint8_t szx,
@@ -620,65 +1096,16 @@ int cloud_client_oscore_block2_get(const char *path, uint8_t szx,
 	while (more && (max_blocks == 0 || blocks_done < max_blocks)) {
 		struct coap_packet response;
 		struct coap_oscore_response resp;
-		int attempts = 0;
-		bool got = false;
+		struct block2_get_args args = { .path = path, .block_num = block_num, .szx = szx };
 
-		err = block2_send_request(path, block_num, szx);
+		err = block_exchange("block2", path, block_num, block2_build_request, &args,
+				     &resp, &response);
 		if (err) {
 			return err;
 		}
-
-		while (!got) {
-			oscore_cloud_feed_wdt();
-
-			struct zsock_pollfd pfd = { .fd = g_sock, .events = ZSOCK_POLLIN };
-			int pr = zsock_poll(&pfd, 1, BLOCK2_RECV_TIMEOUT_MS);
-
-			if (pr < 0) {
-				LOG_ERR("block2 poll %s blk %u: %d", path, block_num, -errno);
-				return -errno;
-			}
-			if (pr == 0 || !(pfd.revents & ZSOCK_POLLIN)) {
-				if (++attempts > BLOCK2_MAX_RETRIES) {
-					LOG_ERR("block2 %s blk %u: no response after %d attempts",
-						path, block_num, attempts);
-					return -ETIMEDOUT;
-				}
-				LOG_WRN("block2 %s blk %u: recv timeout, retransmit %d/%d",
-					path, block_num, attempts, BLOCK2_MAX_RETRIES);
-				err = block2_send_request(path, block_num, szx);
-				if (err) {
-					return err;
-				}
-				continue;
-			}
-
-			err = oscore_recv_response(path, &resp, &response);
-			if (err) {
-				/* Stale/duplicate/garbled datagram (e.g. a late response
-				 * to a previous attempt that fails OSCORE verification).
-				 * Recoverable: retransmit and keep waiting.
-				 */
-				if (++attempts > BLOCK2_MAX_RETRIES) {
-					LOG_ERR("block2 %s blk %u: recv error %d after retries",
-						path, block_num, err);
-					return err;
-				}
-				LOG_WRN("block2 %s blk %u: recv error %d, retransmit %d/%d",
-					path, block_num, err, attempts, BLOCK2_MAX_RETRIES);
-				err = block2_send_request(path, block_num, szx);
-				if (err) {
-					return err;
-				}
-				continue;
-			}
-
-			if (resp.code != COAP_RESPONSE_CODE_CONTENT) {
-				LOG_ERR("block2 GET %s blk %u: code 0x%02x", path, block_num,
-					resp.code);
-				return -EIO;
-			}
-			got = true;
+		if (resp.code != COAP_RESPONSE_CODE_CONTENT) {
+			LOG_ERR("block2 GET %s blk %u: code 0x%02x", path, block_num, resp.code);
+			return -EIO;
 		}
 
 		bool has_more = false;
@@ -730,33 +1157,41 @@ int cloud_client_oscore_block2_get(const char *path, uint8_t szx,
 	return 0;
 }
 
-/* Build, OSCORE-protect, and send one Block2 POST request. The CBOR request body
- * is included only on block 0 (matching the server, which decodes the request on
+struct block2_post_args {
+	const char *path;
+	uint32_t block_num;
+	uint8_t szx;
+	const uint8_t *body;
+	size_t body_len;
+};
+
+/* Build and OSCORE-protect one Block2 POST request. The CBOR request body is
+ * included only on block 0 (matching the server, which decodes the request on
  * the first POST and serves continuation blocks from its per-device cache);
  * later blocks are empty POSTs carrying just the incremented Block2 option. */
-static int block2_post_send_request(const char *path, uint32_t block_num, uint8_t szx,
-				    const uint8_t *body, size_t body_len)
+static int block2_post_build_request(const void *arg, size_t *out_len)
 {
+	const struct block2_post_args *a = arg;
 	struct coap_packet request;
 	ssize_t len;
 	int err;
 
 	err = coap_packet_init(&request, coap_buf, sizeof(coap_buf), COAP_VERSION_1,
-			       COAP_TYPE_CON, 8, coap_next_token(), COAP_METHOD_POST,
+			       COAP_TYPE_CON, COAP_TOKEN_LEN, next_token(), COAP_METHOD_POST,
 			       coap_next_id());
 	if (err) {
 		return err;
 	}
-	err = append_uri_path(&request, path);
+	err = append_uri_path(&request, a->path);
 	if (err) {
 		return err;
 	}
-	err = append_block2_option(&request, block_num, szx);
+	err = append_block2_option(&request, a->block_num, a->szx);
 	if (err) {
 		return err;
 	}
 
-	if (block_num == 0 && body && body_len > 0) {
+	if (a->block_num == 0 && a->body && a->body_len > 0) {
 		err = coap_append_option_int(&request, COAP_OPTION_CONTENT_FORMAT,
 					     COAP_CONTENT_FORMAT_APPLICATION_CBOR);
 		if (err) {
@@ -766,7 +1201,7 @@ static int block2_post_send_request(const char *path, uint32_t block_num, uint8_
 		if (err) {
 			return err;
 		}
-		err = coap_packet_append_payload(&request, body, body_len);
+		err = coap_packet_append_payload(&request, a->body, a->body_len);
 		if (err) {
 			return err;
 		}
@@ -775,14 +1210,11 @@ static int block2_post_send_request(const char *path, uint32_t block_num, uint8_
 	len = request.offset;
 	err = oscore_wrapper_protect(coap_buf, (size_t *)&len, sizeof(coap_buf));
 	if (err) {
-		LOG_ERR("oscore protect block2 post %s blk %u: %d", path, block_num, err);
+		LOG_ERR("oscore protect block2 post %s blk %u: %d", a->path, a->block_num, err);
 		return err;
 	}
-
-	flush_rx();
-
-	apply_rai_ongoing();
-	return sock_send("block2 post", path, block_num, len);
+	*out_len = (size_t)len;
+	return 0;
 }
 
 int cloud_client_oscore_block2_post(const char *path, const uint8_t *body, size_t body_len,
@@ -801,64 +1233,20 @@ int cloud_client_oscore_block2_post(const char *path, const uint8_t *body, size_
 	while (more) {
 		struct coap_packet response;
 		struct coap_oscore_response resp;
-		int attempts = 0;
-		bool got = false;
+		struct block2_post_args args = {
+			.path = path, .block_num = block_num, .szx = szx,
+			.body = body, .body_len = body_len,
+		};
 
-		err = block2_post_send_request(path, block_num, szx, body, body_len);
+		err = block_exchange("block2 post", path, block_num, block2_post_build_request,
+				     &args, &resp, &response);
 		if (err) {
 			return err;
 		}
-
-		while (!got) {
-			oscore_cloud_feed_wdt();
-
-			struct zsock_pollfd pfd = { .fd = g_sock, .events = ZSOCK_POLLIN };
-			int pr = zsock_poll(&pfd, 1, BLOCK2_RECV_TIMEOUT_MS);
-
-			if (pr < 0) {
-				LOG_ERR("block2 post poll %s blk %u: %d", path, block_num, -errno);
-				return -errno;
-			}
-			if (pr == 0 || !(pfd.revents & ZSOCK_POLLIN)) {
-				if (++attempts > BLOCK2_MAX_RETRIES) {
-					LOG_ERR("block2 post %s blk %u: no response after %d",
-						path, block_num, attempts);
-					return -ETIMEDOUT;
-				}
-				LOG_WRN("block2 post %s blk %u: timeout, retransmit %d/%d",
-					path, block_num, attempts, BLOCK2_MAX_RETRIES);
-				err = block2_post_send_request(path, block_num, szx, body,
-							       body_len);
-				if (err) {
-					return err;
-				}
-				continue;
-			}
-
-			err = oscore_recv_response(path, &resp, &response);
-			if (err) {
-				if (++attempts > BLOCK2_MAX_RETRIES) {
-					LOG_ERR("block2 post %s blk %u: recv error %d",
-						path, block_num, err);
-					return err;
-				}
-				LOG_WRN("block2 post %s blk %u: recv error %d, retransmit %d/%d",
-					path, block_num, err, attempts, BLOCK2_MAX_RETRIES);
-				err = block2_post_send_request(path, block_num, szx, body,
-							       body_len);
-				if (err) {
-					return err;
-				}
-				continue;
-			}
-
-			if (resp.code != COAP_RESPONSE_CODE_CONTENT &&
-			    resp.code != COAP_RESPONSE_CODE_CHANGED) {
-				LOG_ERR("block2 POST %s blk %u: code 0x%02x", path, block_num,
-					resp.code);
-				return -EIO;
-			}
-			got = true;
+		if (resp.code != COAP_RESPONSE_CODE_CONTENT &&
+		    resp.code != COAP_RESPONSE_CODE_CHANGED) {
+			LOG_ERR("block2 POST %s blk %u: code 0x%02x", path, block_num, resp.code);
+			return -EIO;
 		}
 
 		bool has_more = false;
@@ -909,29 +1297,38 @@ static int append_block1_option(struct coap_packet *req, uint32_t block_num, uin
 	return coap_packet_append_option(req, COAP_OPTION_BLOCK1, enc, elen);
 }
 
-/* Build, OSCORE-protect and send one Block1 POST carrying [chunk, chunk_len). */
-static int block1_send_request(const char *path, uint32_t block_num, uint8_t szx, bool more,
-			       const uint8_t *chunk, size_t chunk_len)
+struct block1_args {
+	const char *path;
+	uint32_t block_num;
+	uint8_t szx;
+	bool more;
+	const uint8_t *chunk;
+	size_t chunk_len;
+};
+
+/* Build and OSCORE-protect one Block1 POST carrying [chunk, chunk_len). */
+static int block1_build_request(const void *arg, size_t *out_len)
 {
+	const struct block1_args *a = arg;
 	struct coap_packet request;
 	ssize_t len;
 	int err;
 
 	err = coap_packet_init(&request, coap_buf, sizeof(coap_buf), COAP_VERSION_1,
-			       COAP_TYPE_CON, 8, coap_next_token(), COAP_METHOD_POST,
+			       COAP_TYPE_CON, COAP_TOKEN_LEN, next_token(), COAP_METHOD_POST,
 			       coap_next_id());
 	if (err) {
 		return err;
 	}
-	err = append_uri_path(&request, path);
+	err = append_uri_path(&request, a->path);
 	if (err) {
 		return err;
 	}
-	err = append_block1_option(&request, block_num, szx, more);
+	err = append_block1_option(&request, a->block_num, a->szx, a->more);
 	if (err) {
 		return err;
 	}
-	if (chunk && chunk_len > 0) {
+	if (a->chunk && a->chunk_len > 0) {
 		err = coap_append_option_int(&request, COAP_OPTION_CONTENT_FORMAT,
 					     COAP_CONTENT_FORMAT_APPLICATION_CBOR);
 		if (err) {
@@ -941,7 +1338,7 @@ static int block1_send_request(const char *path, uint32_t block_num, uint8_t szx
 		if (err) {
 			return err;
 		}
-		err = coap_packet_append_payload(&request, chunk, chunk_len);
+		err = coap_packet_append_payload(&request, a->chunk, a->chunk_len);
 		if (err) {
 			return err;
 		}
@@ -950,14 +1347,11 @@ static int block1_send_request(const char *path, uint32_t block_num, uint8_t szx
 	len = request.offset;
 	err = oscore_wrapper_protect(coap_buf, (size_t *)&len, sizeof(coap_buf));
 	if (err) {
-		LOG_ERR("oscore protect block1 %s blk %u: %d", path, block_num, err);
+		LOG_ERR("oscore protect block1 %s blk %u: %d", a->path, a->block_num, err);
 		return err;
 	}
-
-	flush_rx();
-
-	apply_rai_ongoing();
-	return sock_send("block1", path, block_num, len);
+	*out_len = (size_t)len;
+	return 0;
 }
 
 int cloud_client_oscore_block1_post(const char *path, size_t total_len, uint8_t szx,
@@ -989,59 +1383,24 @@ int cloud_client_oscore_block1_post_from(const char *path, size_t total_len, uin
 			LOG_ERR("block1 source %s @%zu: %d", path, offset, got);
 			return got < 0 ? got : -EIO;
 		}
-		bool more = (offset + (size_t)got) < total_len;
-		int attempts = 0;
-		bool acked = false;
 
-		err = block1_send_request(path, block_num, szx, more, chunk, (size_t)got);
+		struct coap_oscore_response resp;
+		struct block1_args args = {
+			.path = path, .block_num = block_num, .szx = szx,
+			.more = (offset + (size_t)got) < total_len,
+			.chunk = chunk, .chunk_len = (size_t)got,
+		};
+
+		err = block_exchange("block1", path, block_num, block1_build_request, &args,
+				     &resp, NULL);
 		if (err) {
 			return err;
 		}
-
-		while (!acked) {
-			oscore_cloud_feed_wdt();
-
-			struct zsock_pollfd pfd = { .fd = g_sock, .events = ZSOCK_POLLIN };
-			int pr = zsock_poll(&pfd, 1, BLOCK2_RECV_TIMEOUT_MS);
-
-			if (pr < 0) {
-				return -errno;
-			}
-			if (pr == 0 || !(pfd.revents & ZSOCK_POLLIN)) {
-				if (++attempts > BLOCK2_MAX_RETRIES) {
-					LOG_ERR("block1 %s blk %u: no ack", path, block_num);
-					return -ETIMEDOUT;
-				}
-				err = block1_send_request(path, block_num, szx, more, chunk,
-							  (size_t)got);
-				if (err) {
-					return err;
-				}
-				continue;
-			}
-
-			struct coap_oscore_response resp;
-
-			err = oscore_recv_response(path, &resp, NULL);
-			if (err) {
-				if (++attempts > BLOCK2_MAX_RETRIES) {
-					return err;
-				}
-				err = block1_send_request(path, block_num, szx, more, chunk,
-							  (size_t)got);
-				if (err) {
-					return err;
-				}
-				continue;
-			}
-			/* 2.31 Continue while more blocks expected, 2.04 Changed on done. */
-			if (resp.code != COAP_RESPONSE_CODE_CHANGED &&
-			    resp.code != 0x5F /* 2.31 Continue */) {
-				LOG_ERR("block1 %s blk %u: code 0x%02x", path, block_num,
-					resp.code);
-				return -EIO;
-			}
-			acked = true;
+		/* 2.31 Continue while more blocks expected, 2.04 Changed on done. */
+		if (resp.code != COAP_RESPONSE_CODE_CHANGED &&
+		    resp.code != 0x5F /* 2.31 Continue */) {
+			LOG_ERR("block1 %s blk %u: code 0x%02x", path, block_num, resp.code);
+			return -EIO;
 		}
 
 		offset += (size_t)got;
@@ -1840,3 +2199,91 @@ int cloud_client_process_downlink(const struct cloud_downlink *dl, cloud_shadow_
 	}
 	return 0;
 }
+
+/* ------------------------------------------------------------------------
+ * Shell: coap [bearer auto|tn|ntn] [impair <tx%> <rx%> <delay_ms>] [reset]
+ * ------------------------------------------------------------------------ */
+#if defined(CONFIG_SHELL)
+static int cmd_coap_show(const struct shell *sh, size_t argc, char **argv)
+{
+	const struct xmit_profile *p = xmit_profile();
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	shell_print(sh, "bearer %s (detected %s, override %s)",
+		    cloud_client_transport() == CLOUD_TRANSPORT_NTN ? "NTN" : "TN",
+		    g_bearer_detected == CLOUD_TRANSPORT_NTN ? "NTN" : "TN",
+		    g_bearer_override == BEARER_AUTO ? "auto" :
+		    g_bearer_override == BEARER_FORCE_TN ? "tn" : "ntn");
+	shell_print(sh, "ACK timeout %u ms, max retransmit %u, token %u B", p->ack_timeout_ms,
+		    p->max_retransmit, COAP_TOKEN_LEN);
+	shell_print(sh, "requests %u retransmits %u timeouts %u stale %u empty_acks %u "
+		    "con_acked %u rtt last %u max %u ms",
+		    g_xstats.requests, g_xstats.retransmits, g_xstats.timeouts, g_xstats.stale,
+		    g_xstats.empty_acks, g_xstats.con_acked, g_xstats.last_rtt_ms,
+		    g_xstats.max_rtt_ms);
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+	shell_print(sh, "impair tx %u%% rx %u%% delay %u ms (dropped tx %u rx %u)",
+		    g_impair.tx_drop_pct, g_impair.rx_drop_pct, g_impair.delay_ms,
+		    g_impair.tx_dropped, g_impair.rx_dropped);
+#endif
+	return 0;
+}
+
+static int cmd_coap_bearer(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc != 2) {
+		shell_error(sh, "usage: coap bearer auto|tn|ntn");
+		return -EINVAL;
+	}
+	if (strcmp(argv[1], "auto") == 0) {
+		g_bearer_override = BEARER_AUTO;
+	} else if (strcmp(argv[1], "tn") == 0) {
+		g_bearer_override = BEARER_FORCE_TN;
+	} else if (strcmp(argv[1], "ntn") == 0) {
+		g_bearer_override = BEARER_FORCE_NTN;
+	} else {
+		shell_error(sh, "usage: coap bearer auto|tn|ntn");
+		return -EINVAL;
+	}
+	log_bearer();
+	return cmd_coap_show(sh, 1, argv);
+}
+
+static int cmd_coap_reset(const struct shell *sh, size_t argc, char **argv)
+{
+	memset(&g_xstats, 0, sizeof(g_xstats));
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+	g_impair.tx_dropped = 0;
+	g_impair.rx_dropped = 0;
+#endif
+	return cmd_coap_show(sh, argc, argv);
+}
+
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+static int cmd_coap_impair(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc != 4) {
+		shell_error(sh, "usage: coap impair <tx_drop_%%> <rx_drop_%%> <delay_ms>");
+		return -EINVAL;
+	}
+	g_impair.tx_drop_pct = (uint8_t)MIN(strtoul(argv[1], NULL, 10), 100UL);
+	g_impair.rx_drop_pct = (uint8_t)MIN(strtoul(argv[2], NULL, 10), 100UL);
+	g_impair.delay_ms = (uint32_t)strtoul(argv[3], NULL, 10);
+	return cmd_coap_show(sh, 1, argv);
+}
+#endif
+
+SHELL_STATIC_SUBCMD_SET_CREATE(
+	coap_cmds,
+	SHELL_CMD(bearer, NULL, "Force the bearer profile: auto|tn|ntn", cmd_coap_bearer),
+#if defined(CONFIG_OSCORE_CLOUD_TEST_IMPAIR)
+	SHELL_CMD(impair, NULL, "Test impairment: <tx_drop_%> <rx_drop_%> <delay_ms>",
+		  cmd_coap_impair),
+#endif
+	SHELL_CMD(reset, NULL, "Reset the counters", cmd_coap_reset),
+	SHELL_SUBCMD_SET_END);
+
+SHELL_CMD_REGISTER(coap, &coap_cmds, "CoAP transport: bearer, timeouts, counters",
+		   cmd_coap_show);
+#endif /* CONFIG_SHELL */

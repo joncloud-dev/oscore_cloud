@@ -27,6 +27,21 @@ if(CONFIG_UOSCORE)
   zephyr_compile_definitions(OSCORE_MAX_PLAINTEXT_LEN=1536)
 endif()
 
+# EDHOC (B3): process message_4 (the server always sends it; key
+# confirmation), compile out X.509 (CCS credentials only), and size uedhoc's fixed buffers for the A5 profile. CCS
+# credentials are about 100 B and ID_CRED_x is { 4 : kid } with a 1-4 B kid;
+# the 400 B defaults would cost several KB of cloud-thread stack.
+if(CONFIG_OSCORE_CLOUD_EDHOC)
+  zephyr_compile_definitions(
+    MESSAGE_4
+    EDHOC_NO_X509
+    CRED_I_SIZE=160
+    CRED_R_SIZE=160
+    ID_CRED_I_SIZE=16
+    ID_CRED_R_SIZE=16
+  )
+endif()
+
 zephyr_include_directories(include)
 
 zephyr_library()
@@ -36,6 +51,14 @@ zephyr_library_sources(
   src/oscore_wrapper.c
   src/oscore_provision.c
 )
+if(CONFIG_OSCORE_CLOUD_EDHOC)
+  # uedhoc's P-256 point decompression (G_X / G_Y travel as x only) is not in
+  # Zephyr's uedhoc module build; oscore_edhoc.c's ECDH hook needs it.
+  set(UEDHOC_P256_SRC ${ZEPHYR_UOSCORE_UEDHOC_MODULE_DIR}/src/common/crypto_p256.c)
+  zephyr_library_sources(src/oscore_edhoc.c ${UEDHOC_P256_SRC})
+  set_source_files_properties(${UEDHOC_P256_SRC} PROPERTIES COMPILE_DEFINITIONS MBEDTLS)
+  zephyr_library_include_directories(${ZEPHYR_UOSCORE_UEDHOC_MODULE_DIR}/src/common)
+endif()
 zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_FOTA    src/fota_client.c)
 zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_AGNSS   src/agnss_client.c)
 zephyr_library_sources_ifdef(CONFIG_OSCORE_CLOUD_PGPS    src/pgps_client.c)

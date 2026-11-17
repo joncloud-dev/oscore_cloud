@@ -25,14 +25,52 @@ config OSCORE_SERVER_IP
 	  compile-time default by the client when the application does not set
 	  struct oscore_cloud_config.server_ip at runtime.
 
-config OSCORE_USE_EDHOC
-	bool "Use EDHOC for OSCORE key establishment"
-	default n
+config OSCORE_CLOUD_EDHOC
+	bool "EDHOC initiator (method 3, suite 2)"
+	depends on UOSCORE && SETTINGS
+	select UEDHOC
 	help
-	  Run EDHOC (POST /.well-known/edhoc) with the server to derive the OSCORE
-	  context at runtime instead of using a provisioned / hardcoded context.
-	  When enabled, the application must provide edhoc_credentials.h. Leave
-	  disabled to use the bench-provisioned opaque-key context (the default).
+	  EDHOC against the server's /.well-known/edhoc (NTN security B3). The
+	  static P-256 key is generated in PSA on the device (shell: edhoc
+	  keygen); credentials are provisioned from the shell. A run is started
+	  from the shell (edhoc run) and executes on the cloud thread on TN.
+	  Needs the uoscore-uedhoc fork with RFC 9528 kid handling. Traffic
+	  stays on the PSK context until B4 adds the transition.
+
+config OSCORE_CLOUD_EPOCH_WINDOW
+	int "PSK epoch window W"
+	default 4
+	range 1 16
+	help
+	  The device never moves past confirmed + W, where confirmed is the newest
+	  epoch a verified response has proven. Must equal the server's window
+	  (go/internal/platform/provider EpochWindow), which derives only active+1 .. active+W.
+
+config OSCORE_CLOUD_EPOCH_SELF_BUMP_MISSES
+	int "Self-bump after this many CON requests without a verified response"
+	default 5
+	range 0 255
+	help
+	  K in docs/NTN-SECURITY-A3.md rule 3. A server whose forgery limit
+	  (limit_v) is spent can no longer verify the device, so it cannot ask for
+	  a rekey; after K consecutive CON requests whose response timed out or
+	  failed verification the device moves to the next epoch on its own. An
+	  outage spends at most W epochs, harmlessly. NON requests never count.
+	  0 disables the self-bump.
+
+config OSCORE_CLOUD_EPOCH_SELF_BUMP_MIN_SECONDS
+	int "Minimum time between the first miss and a self-bump (seconds)"
+	default 600
+	help
+	  Time floor for the self-bump, measured from the first miss of the run
+	  in the current boot. Keeps short NTN gaps from spending epochs.
+
+config OSCORE_CLOUD_EPOCH_SSN_LIMIT
+	int "Move to the next epoch at this sender sequence number"
+	default 65024
+	help
+	  Local backstop that keeps the PIV at 2 bytes. The server asks for a
+	  rekey from 2^16 - 2^12; this fires only if that signal was missed.
 
 config OSCORE_CLOUD_BLOCK2_SZX
 	int "Block2 download block size exponent (SZX)"
@@ -47,6 +85,48 @@ config OSCORE_CLOUD_BLOCK2_SZX
 	  disabled. Older servers re-fragment any OSCORE ciphertext of 1024 B or more
 	  with an outer Block2 option that this client does not reassemble, and every
 	  block then fails to decrypt (uoscore error -3). Set 5 for those servers.
+
+config OSCORE_CLOUD_COAP_ACK_TIMEOUT_MS
+	int "CoAP ACK_TIMEOUT on terrestrial LTE (ms)"
+	default 5000
+	range 1000 120000
+	help
+	  RFC 7252 ACK_TIMEOUT for CON requests on TN (LTE-M / NB-IoT). The
+	  first wait is ACK_TIMEOUT x [1, 1.5) and doubles with every
+	  retransmission. Retransmissions resend the identical protected bytes
+	  (no new OSCORE SSN); the server answers them from its response cache.
+	  With 5000 ms and 2 retransmissions a request gives up after 35-52 s,
+	  close to the fixed 30 s wait used before B2.
+
+config OSCORE_CLOUD_COAP_MAX_RETRANSMIT
+	int "CoAP MAX_RETRANSMIT on terrestrial LTE"
+	default 2
+	range 0 8
+
+config OSCORE_CLOUD_COAP_NTN_ACK_TIMEOUT_MS
+	int "CoAP ACK_TIMEOUT on NTN NB-IoT (ms)"
+	default 15000
+	range 1000 300000
+	help
+	  ACK_TIMEOUT when the modem reports NTN NB-IoT (LTE mode 14) or the
+	  shell forces the NTN profile (coap bearer ntn). GEO NB-IoT adds about
+	  0.5 s of propagation per round trip plus long uplink scheduling, so
+	  application round trips of several seconds are normal and an early
+	  retransmission only wastes satellite bytes. With 15000 ms and 2
+	  retransmissions a request gives up after 105-157 s.
+
+config OSCORE_CLOUD_COAP_NTN_MAX_RETRANSMIT
+	int "CoAP MAX_RETRANSMIT on NTN NB-IoT"
+	default 2
+	range 0 8
+
+config OSCORE_CLOUD_TEST_IMPAIR
+	bool "Test-only link impairment (shell: coap impair)"
+	depends on SHELL
+	help
+	  Lets the shell drop a share of transmitted and received datagrams and
+	  add a minimum round-trip time, to exercise retransmission and the NTN
+	  timeouts without a satellite link. Never enable in production.
 
 config OSCORE_CLOUD_RAI
 	bool "Release Assistance Indication (SO_RAI) hints"

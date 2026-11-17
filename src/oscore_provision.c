@@ -13,6 +13,7 @@
  */
 
 #include <oscore_cloud/oscore_provision.h>
+#include <oscore_cloud/oscore_wrapper.h>
 
 #include <errno.h>
 #include <string.h>
@@ -302,6 +303,50 @@ static int cmd_oscore_verify(const struct shell *sh, size_t argc, char **argv)
 	return ret;
 }
 
+static int cmd_oscore_epoch(const struct shell *sh, size_t argc, char **argv)
+{
+	struct oscore_epoch_status st;
+	int err;
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	err = oscore_wrapper_epoch_status(&st);
+	if (err) {
+		shell_error(sh, "No PSK epoch state (%d)", err);
+		return err;
+	}
+	shell_print(sh, "epoch %u confirmed %u ssn %llu misses %u%s%s%s", st.epoch, st.confirmed,
+		    (unsigned long long)st.ssn, st.misses, st.ready ? "" : " (no context)",
+		    st.kid_context_sent ? " kid-context" : "",
+		    st.rekey_requested ? " rekey-requested" : "");
+	return 0;
+}
+
+static int cmd_oscore_epoch_bump(const struct shell *sh, size_t argc, char **argv)
+{
+	int err;
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	err = oscore_wrapper_epoch_request_bump();
+	if (err == -EALREADY) {
+		shell_error(sh, "Already at confirmed + %d", CONFIG_OSCORE_CLOUD_EPOCH_WINDOW);
+	} else if (err) {
+		shell_error(sh, "Bump refused (%d)", err);
+	} else {
+		shell_print(sh, "Next request moves to the next epoch");
+	}
+	return err;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(
+	oscore_epoch_subcmds,
+	SHELL_CMD(bump, NULL, "Move to the next PSK epoch before the next request",
+		  cmd_oscore_epoch_bump),
+	SHELL_SUBCMD_SET_END);
+
 SHELL_STATIC_SUBCMD_SET_CREATE(
 	oscore_subcmds,
 	SHELL_CMD_ARG(provision, NULL,
@@ -311,6 +356,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD(verify, NULL,
 		  "Prove the provisioned master secret is non-exportable (opacity check)",
 		  cmd_oscore_verify),
+	SHELL_CMD(epoch, &oscore_epoch_subcmds, "Show the PSK epoch state", cmd_oscore_epoch),
 	SHELL_SUBCMD_SET_END);
 
 SHELL_CMD_REGISTER(oscore, &oscore_subcmds, "OSCORE provisioning", NULL);
